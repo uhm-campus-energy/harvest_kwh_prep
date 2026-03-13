@@ -1,0 +1,11 @@
+# packages
+python
+numpy
+pandas
+matplotlib
+openpyxl
+
+scikit-learn
+
+
+jupyter
