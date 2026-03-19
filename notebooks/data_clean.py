@@ -50,23 +50,252 @@ def fill_missing_timestamps(df, freq):
 ###################################################################
 ###################################################################
 
-def apply_special_meter_corrections(data, special_meters_file):
+def prepare_meter_dataframe(df_long, value_col=None, freq=None, agg="last"):
     """
-    Apply special corrections to selected meters based on an Excel config file.
-    Correctly handles multiple periods per meter, including overlapping periods.
+    Convert long format meter data (harvest processed data) into a wide 
+    datetime x meter dataframe.
 
-    Returns a copy of the DataFrame.
+    Parameters:
+        df_long (pd.DataFrame): Must include datetime and meter_name, plus a value column.
+        value_col (str | None): Preferred numeric value column. Examples:
+            Aurora kwh: meter_reading
+            Harvest kwh: kwh
+            Aurora kw: mean
+            Harvest kw: mean_kw
+        freq (str | None): If provided, fill to a complete timestamp grid.
+        agg (str): Aggregation used when duplicate datetime/meter rows exist.
+
+    Returns:
+        pd.DataFrame with columns ['datetime', <meter columns...>]
+    """
+    if "datetime" not in df_long.columns or "meter_name" not in df_long.columns:
+        raise ValueError("Input long dataframe must contain 'datetime' and 'meter_name' columns.")
+
+    df_long = df_long.copy()
+    df_long["datetime"] = pd.to_datetime(df_long["datetime"])
+
+    candidate_cols = []
+    if value_col is not None:
+        candidate_cols.append(value_col)
+    candidate_cols.extend(["kwh", "mean_kw", "meter_reading", "mean", "kw"])
+
+    resolved_value_col = None
+    for col in candidate_cols:
+        if col in df_long.columns:
+            resolved_value_col = col
+            break
+
+    if resolved_value_col is None:
+        raise ValueError(
+            "Could not determine meter value column. Tried: "
+            + ", ".join(candidate_cols)
+        )
+
+    grouped = (
+        df_long
+        .groupby(["datetime", "meter_name"], as_index=False)[resolved_value_col]
+        .agg(agg)
+    )
+
+    pivoted_df = (
+        grouped
+        .pivot(index="datetime", columns="meter_name", values=resolved_value_col)
+        .reset_index()
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+    if freq:
+        pivoted_df = fill_missing_timestamps(pivoted_df, freq)
+
+    return pivoted_df
+
+
+###################################################################
+###################################################################
+# TODO: run code, 
+
+def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_rows_per_meter=5):
+    """
+    Suggest candidate meter issues to help automate the old manual flagging meters.
+
+    Returns a DataFrame with columns:
+        meter_name, issue_type, start_datetime, end_datetime, details, suggestion
+    """
+    suggestions = []
+
+    for meter in data.columns:
+        series = data[meter].dropna()
+        if series.empty:
+            suggestions.append({
+                "meter_name": meter,
+                "issue_type": "all_nan",
+                "start_datetime": pd.NaT,
+                "end_datetime": pd.NaT,
+                "details": "Meter has no valid values in the selected window.",
+                "suggestion": "review"
+            })
+            continue
+
+        # Stuck runs
+        run_start = None
+        prev_val = None
+        run_len = 0
+        added_for_meter = 0
+
+        for t, val in series.items():
+            if prev_val is not None and val == prev_val:
+                if run_start is None:
+                    run_start = prev_time
+                    run_len = 2
+                else:
+                    run_len += 1
+            else:
+                if run_start is not None and run_len >= stuck_run_threshold:
+                    suggestions.append({
+                        "meter_name": meter,
+                        "issue_type": "stuck_run",
+                        "start_datetime": run_start,
+                        "end_datetime": prev_time,
+                        "details": f"Consecutive repeated values for {run_len} points.",
+                        "suggestion": "review/remove_or_no_interp"
+                    })
+                    added_for_meter += 1
+                    if added_for_meter >= max_rows_per_meter:
+                        break
+                run_start = None
+                run_len = 1
+
+            prev_val = val
+            prev_time = t
+
+        if added_for_meter < max_rows_per_meter and run_start is not None and run_len >= stuck_run_threshold:
+            suggestions.append({
+                "meter_name": meter,
+                "issue_type": "stuck_run",
+                "start_datetime": run_start,
+                "end_datetime": prev_time,
+                "details": f"Consecutive repeated values for {run_len} points.",
+                "suggestion": "review/remove_or_no_interp"
+            })
+            added_for_meter += 1
+
+        diffs = series.diff()
+
+        # Restarts / drops
+        neg_diffs = diffs[diffs < 0]
+        for t, diff_val in neg_diffs.head(max_rows_per_meter).items():
+            prev_idx = series.index[series.index.get_loc(t) - 1] if series.index.get_loc(t) > 0 else pd.NaT
+            suggestions.append({
+                "meter_name": meter,
+                "issue_type": "restart_or_drop",
+                "start_datetime": prev_idx,
+                "end_datetime": t,
+                "details": f"Negative jump of {diff_val}.",
+                "suggestion": "review_restart"
+            })
+
+        # Unusually large positive jumps
+        pos_diffs = diffs[diffs > 0]
+        if not pos_diffs.empty:
+            median_diff = pos_diffs.median()
+            if pd.notna(median_diff) and median_diff > 0:
+                large_jumps = pos_diffs[pos_diffs > median_diff * jump_multiplier]
+                for t, diff_val in large_jumps.head(max_rows_per_meter).items():
+                    prev_idx = series.index[series.index.get_loc(t) - 1] if series.index.get_loc(t) > 0 else pd.NaT
+                    suggestions.append({
+                        "meter_name": meter,
+                        "issue_type": "large_jump",
+                        "start_datetime": prev_idx,
+                        "end_datetime": t,
+                        "details": f"Positive jump of {diff_val}, median positive jump {median_diff}.",
+                        "suggestion": "review_div100_or_remove"
+                    })
+
+    if not suggestions:
+        return pd.DataFrame(columns=[
+            "meter_name", "issue_type", "start_datetime", "end_datetime", "details", "suggestion"
+        ])
+
+    return pd.DataFrame(suggestions).sort_values(
+        by=["meter_name", "start_datetime", "issue_type"],
+        na_position="last"
+    ).reset_index(drop=True)
+
+
+###################################################################
+###################################################################
+
+def apply_special_meter_corrections(data, special_meters_file):
+    # ===== ORIGINAL ZHILING / AURORA CODE (commented out) =====
+    #     """
+    #     Apply special corrections to selected meters based on an Excel config file.
+    #     Correctly handles multiple periods per meter, including overlapping periods.
+    #
+    #     Returns a copy of the DataFrame.
+    #     """
+    #     data_corrected = data.copy()
+    #     bad_periods = pd.read_excel(special_meters_file)
+    #
+    #     # Clean up
+    #     bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
+    #     bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
+    #     bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
+    #     bad_periods["end_datetime"] = pd.to_datetime(bad_periods["end_datetime"])
+    #
+    #     # Filter to meters that exist in data
+    #     bad_periods = bad_periods[bad_periods["meter_name"].isin(data_corrected.columns)]
+    #
+    #     for _, row in bad_periods.iterrows():
+    #         meter = row["meter_name"]
+    #         start = row["start_datetime"]
+    #         end = row["end_datetime"]
+    #         solution = row["solution"]
+    #
+    #         # mask points in the period
+    #         mask = (data_corrected.index >= start) & (data_corrected.index <= end)
+    #
+    #         if solution == "div100":
+    #             data_corrected.loc[mask, meter] = data_corrected.loc[mask, meter] / 100.0
+    #         elif solution == "remove":
+    #             data_corrected.loc[mask, meter] = np.nan
+    #
+    #     return data_corrected
+
+    """
+    Apply manual meter corrections from an Excel config file.
+
+    Harvest/current behavior:
+    - safely skips if the file path is None, empty, or missing
+    - expects the same core columns as Aurora:
+      meter_name, solution, start_datetime, end_datetime
+    - supports at least: div100, remove
     """
     data_corrected = data.copy()
-    bad_periods = pd.read_excel(special_meters_file)
 
-    # Clean up
+    if special_meters_file is None or str(special_meters_file).strip() == "":
+        print("No special meter file provided. Skipping manual corrections.")
+        return data_corrected
+
+    if not os.path.exists(special_meters_file):
+        print(f'Special meter file not found: {special_meters_file}. Skipping manual corrections.')
+        return data_corrected
+
+    bad_periods = pd.read_excel(special_meters_file)
+    required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
+    missing_cols = required_cols.difference(set(bad_periods.columns))
+    if missing_cols:
+        raise ValueError(
+            "Special meter file is missing required columns: "
+            + ", ".join(sorted(missing_cols))
+        )
+
+    bad_periods = bad_periods.copy()
     bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
     bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
     bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
     bad_periods["end_datetime"] = pd.to_datetime(bad_periods["end_datetime"])
 
-    # Filter to meters that exist in data
     bad_periods = bad_periods[bad_periods["meter_name"].isin(data_corrected.columns)]
 
     for _, row in bad_periods.iterrows():
@@ -75,7 +304,6 @@ def apply_special_meter_corrections(data, special_meters_file):
         end = row["end_datetime"]
         solution = row["solution"]
 
-        # mask points in the period
         mask = (data_corrected.index >= start) & (data_corrected.index <= end)
 
         if solution == "div100":
@@ -312,20 +540,227 @@ def compute_meter_differences(
     r2_threshold=0.9,
     restarts_thres=5,
 ):
-    """
-    Compute start/end values, raw difference, scaled difference, R² info, and % scaled for meters.
-    Returns a DataFrame indexed by meter_name.
+    # ===== ORIGINAL ZHILING / AURORA CODE (commented out) =====
+    #     data,
+    #     start_time,
+    #     end_time,
+    #     df_bad_meters,
+    #     df_restarts,
+    #     valid_len=5*30*96,
+    #     r2_threshold=0.9,
+    #     restarts_thres=5,
+    # ):
+    #     """
+    #     Compute start/end values, raw difference, scaled difference, R² info, and % scaled for meters.
+    #     Returns a DataFrame indexed by meter_name.
+    #
+    #     Assumptions:
+    #         - data has a DatetimeIndex.
+    #         - 0→NaN replacements (if needed) are applied before calling this function.
+    #         - df_bad_meters has columns: meter_name, r2, info.
+    #         - df_restarts has columns: meter_name, previous_valid_time, restart_time.
+    #     """
+    #
+    #     results = []
+    #
+    #     # Map each meter_name to its (numeric r2, info text, original r2 value)
+    #     bad_dict = {}
+    #     if df_bad_meters is not None and not df_bad_meters.empty:
+    #         for row in df_bad_meters.itertuples(index=False):
+    #             meter = row.meter_name
+    #             r2_orig = row.r2
+    #             info = row.info
+    #             try:
+    #                 r2_num = float(r2_orig)
+    #             except Exception:
+    #                 r2_num = np.nan
+    #             bad_dict[meter] = (r2_num, info, r2_orig)
+    #
+    #     start_time = pd.to_datetime(start_time)
+    #     end_time = pd.to_datetime(end_time)
+    #
+    #     # Interval count based on index positions (used for most scaling logic)
+    #     start_idx = data.index.get_loc(start_time)
+    #     end_idx = data.index.get_loc(end_time)
+    #     total_fy_intervals = end_idx - start_idx
+    #
+    #     # Total duration of the analysis window in seconds (used for restart meters)
+    #     fy_seconds = (end_time - start_time).total_seconds()
+    #
+    #     for meter_name in data.columns:
+    #         series = data[meter_name]
+    #
+    #         # Default values for output fields
+    #         start_val = end_val = raw_diff = scaled_diff = np.nan
+    #         st_time = en_time = pd.NaT
+    #         r2_val = np.nan
+    #         info_val = ""
+    #         percent_scaled = np.nan
+    #
+    #         if meter_name not in bad_dict:
+    #             # Meters not flagged as "bad": direct start/end difference if both endpoints exist
+    #             if start_time in series.index and end_time in series.index:
+    #                 start_val = series.loc[start_time]
+    #                 end_val = series.loc[end_time]
+    #                 raw_diff = scaled_diff = end_val - start_val
+    #                 st_time, en_time = start_time, end_time
+    #                 percent_scaled = 0
+    #             r2_val, info_val = f">= {r2_threshold}", ""
+    #
+    #         else:
+    #             r2_num, info, r2_orig = bad_dict[meter_name]
+    #             r2_val = r2_orig
+    #             info_val = info
+    #
+    #             if np.isnan(r2_num):
+    #                 # r2 value could not be interpreted numerically
+    #                 pass
+    #
+    #             elif r2_num == 0:
+    #                 # All values are NaN
+    #                 pass
+    #
+    #             elif r2_num == -1:
+    #                 # Missing start or end: use first and last non-repeated values
+    #                 y = series.where(series.ne(series.shift()))
+    #                 first_valid = y.first_valid_index()
+    #                 last_valid = y.last_valid_index()
+    #                 if first_valid is not None and last_valid is not None:
+    #                     first_val = y.loc[first_valid]
+    #                     last_val = y.loc[last_valid]
+    #                     raw_diff = last_val - first_val
+    #                     n_intervals = y.index.get_loc(last_valid) - y.index.get_loc(first_valid)
+    #                     if n_intervals >= valid_len:
+    #                         scaled_diff = raw_diff / n_intervals * total_fy_intervals
+    #                         percent_scaled = (total_fy_intervals - n_intervals) / total_fy_intervals * 100
+    #                     start_val, end_val = first_val, last_val
+    #                     st_time, en_time = first_valid, last_valid
+    #
+    #             elif r2_num == -2:
+    #                 # Stuck at start or end: remove stuck region, then use first/last remaining values
+    #                 y = series.copy()
+    #                 tokens = str(info).split()
+    #                 stuck_len = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
+    #
+    #                 if stuck_len > 1:
+    #                     if "start" in info:
+    #                         y.iloc[:stuck_len] = np.nan
+    #                     elif "end" in info:
+    #                         y.iloc[-stuck_len:] = np.nan
+    #
+    #                 valid = y.dropna()
+    #                 if len(valid) >= 2:
+    #                     first_idx, last_idx = valid.index[0], valid.index[-1]
+    #                     first_val, last_val = valid.iloc[0], valid.iloc[-1]
+    #                     raw_diff = last_val - first_val
+    #                     n_intervals = y.index.get_loc(last_idx) - y.index.get_loc(first_idx)
+    #                     scaled_diff = raw_diff / n_intervals * total_fy_intervals
+    #                     percent_scaled = (total_fy_intervals - n_intervals) / total_fy_intervals * 100
+    #                     start_val, end_val = first_val, last_val
+    #                     st_time, en_time = first_idx, last_idx
+    #
+    #             elif r2_num == -3:
+    #                 # Meters with restart events (cumulative value drops during the year)
+    #                 meter_restarts = df_restarts[df_restarts["meter_name"] == meter_name]
+    #                 restart_count = len(meter_restarts)
+    #
+    #                 # If the number of restarts is above the threshold, skip usage reconstruction
+    #                 if restart_count > restarts_thres:
+    #                     raw_diff = scaled_diff = percent_scaled = np.nan
+    #
+    #                 else:
+    #                     # Sort restart events in chronological order
+    #                     meter_restarts = meter_restarts.sort_values("restart_time")
+    #
+    #                     # Remove consecutive duplicate readings (keeps only the first in each run)
+    #                     clean_series = series.mask(series.eq(series.shift()))
+    #
+    #                     # Restrict data to the analysis window [start_time, end_time]
+    #                     meter_series = clean_series.loc[start_time:end_time]
+    #
+    #                     # Build segments between restart events where cumulative reading increases normally
+    #                     periods = []
+    #                     prev_time = start_time
+    #
+    #                     for _, r in meter_restarts.iterrows():
+    #                         prev_valid = r["previous_valid_time"]
+    #                         restart_t = r["restart_time"]
+    #
+    #                         # Segment from previous segment start to last valid reading before restart
+    #                         if prev_time < prev_valid:
+    #                             periods.append((prev_time, prev_valid))
+    #
+    #                         prev_time = restart_t
+    #
+    #                     # Final segment from last restart to the end of the analysis window
+    #                     if prev_time < end_time:
+    #                         periods.append((prev_time, end_time))
+    #
+    #                     partial_sum = 0.0
+    #                     partial_seconds = 0.0
+    #
+    #                     # Compute usage and elapsed time for all valid segments
+    #                     for seg_start, seg_end in periods:
+    #                         start_val_seg = meter_series.asof(seg_start)
+    #                         end_val_seg = meter_series.asof(seg_end)
+    #                         if pd.notna(start_val_seg) and pd.notna(end_val_seg):
+    #                             partial_sum += (end_val_seg - start_val_seg)
+    #                             partial_seconds += (seg_end - seg_start).total_seconds()
+    #
+    #                     # Scale partial usage to the full analysis window based on time coverage
+    #                     if partial_seconds > 0 and fy_seconds > 0:
+    #                         scaled_diff = partial_sum * (fy_seconds / partial_seconds)
+    #                         percent_scaled = (fy_seconds - partial_seconds) / fy_seconds * 100
+    #
+    #                     raw_diff = partial_sum
+    #
+    #             elif r2_num == -4 or r2_num > 0:
+    #                 # Too few points, or positive R² but treated as bad without a correction rule
+    #                 raw_diff = scaled_diff = percent_scaled = np.nan
+    #
+    #         results.append((
+    #             meter_name,
+    #             st_time, start_val,
+    #             en_time, end_val,
+    #             raw_diff, scaled_diff,
+    #             r2_val, info_val,
+    #             percent_scaled
+    #         ))
+    #
+    #     result_df = pd.DataFrame(
+    #         results,
+    #         columns=[
+    #             "meter_name", "start_time", "start",
+    #             "end_time", "end",
+    #             "raw_difference", "difference",
+    #             "R²", "info",
+    #             "% scaled"
+    #         ]
+    #     ).set_index("meter_name")
+    #
+    #     def format_percent(row):
+    #         if pd.isna(row["% scaled"]):
+    #             return "N/A" if row["info"] != "" else ""
+    #         elif row["% scaled"] == 0:
+    #             return ""
+    #         else:
+    #             return f"{int(row['% scaled'])}%"
+    #
+    #     result_df["% scaled"] = result_df.apply(format_percent, axis=1)
+    #
+    #     return result_df
 
-    Assumptions:
-        - data has a DatetimeIndex.
-        - 0→NaN replacements (if needed) are applied before calling this function.
-        - df_bad_meters has columns: meter_name, r2, info.
-        - df_restarts has columns: meter_name, previous_valid_time, restart_time.
     """
+    Compute start/end values, raw difference, scaled difference, R² info, and % scaled.
 
+    Current Harvest-aware behavior:
+    - does not require start_time/end_time to exist exactly in the index
+    - works on a generic analysis window, not just a fiscal year
+    - uses time coverage in seconds for scaling when data are irregular
+    """
     results = []
 
-    # Map each meter_name to its (numeric r2, info text, original r2 value)
+    # map each meter_name to its (numeric r2, info text, original r2 value)
     bad_dict = {}
     if df_bad_meters is not None and not df_bad_meters.empty:
         for row in df_bad_meters.itertuples(index=False):
@@ -340,19 +775,34 @@ def compute_meter_differences(
 
     start_time = pd.to_datetime(start_time)
     end_time = pd.to_datetime(end_time)
+    window_seconds = max((end_time - start_time).total_seconds(), 0)
 
-    # Interval count based on index positions (used for most scaling logic)
-    start_idx = data.index.get_loc(start_time)
-    end_idx = data.index.get_loc(end_time)
-    total_fy_intervals = end_idx - start_idx
+    # valid_len was originally measured in 15-minute intervals
+    min_valid_seconds = valid_len * 15 * 60
 
-    # Total duration of the analysis window in seconds (used for restart meters)
-    fy_seconds = (end_time - start_time).total_seconds()
+    def get_window_series(series):
+        series = series.sort_index()
+        return series.loc[(series.index >= start_time) & (series.index <= end_time)]
+
+    def first_last_valid(series):
+        valid = series.dropna()
+        if len(valid) < 2:
+            return pd.NaT, np.nan, pd.NaT, np.nan, np.nan
+        st_time = valid.index[0]
+        en_time = valid.index[-1]
+        start_val = valid.iloc[0]
+        end_val = valid.iloc[-1]
+        raw_diff = end_val - start_val
+        return st_time, start_val, en_time, end_val, raw_diff
+
+    def coverage_percent(covered_seconds):
+        if window_seconds <= 0:
+            return np.nan
+        return max(window_seconds - covered_seconds, 0) / window_seconds * 100
 
     for meter_name in data.columns:
-        series = data[meter_name]
+        series = get_window_series(data[meter_name])
 
-        # Default values for output fields
         start_val = end_val = raw_diff = scaled_diff = np.nan
         st_time = en_time = pd.NaT
         r2_val = np.nan
@@ -360,13 +810,9 @@ def compute_meter_differences(
         percent_scaled = np.nan
 
         if meter_name not in bad_dict:
-            # Meters not flagged as "bad": direct start/end difference if both endpoints exist
-            if start_time in series.index and end_time in series.index:
-                start_val = series.loc[start_time]
-                end_val = series.loc[end_time]
-                raw_diff = scaled_diff = end_val - start_val
-                st_time, en_time = start_time, end_time
-                percent_scaled = 0
+            st_time, start_val, en_time, end_val, raw_diff = first_last_valid(series)
+            scaled_diff = raw_diff
+            percent_scaled = 0 if pd.notna(raw_diff) else np.nan
             r2_val, info_val = f">= {r2_threshold}", ""
 
         else:
@@ -375,31 +821,21 @@ def compute_meter_differences(
             info_val = info
 
             if np.isnan(r2_num):
-                # r2 value could not be interpreted numerically
                 pass
 
             elif r2_num == 0:
-                # All values are NaN
                 pass
 
             elif r2_num == -1:
-                # Missing start or end: use first and last non-repeated values
                 y = series.where(series.ne(series.shift()))
-                first_valid = y.first_valid_index()
-                last_valid = y.last_valid_index()
-                if first_valid is not None and last_valid is not None:
-                    first_val = y.loc[first_valid]
-                    last_val = y.loc[last_valid]
-                    raw_diff = last_val - first_val
-                    n_intervals = y.index.get_loc(last_valid) - y.index.get_loc(first_valid)
-                    if n_intervals >= valid_len:
-                        scaled_diff = raw_diff / n_intervals * total_fy_intervals
-                        percent_scaled = (total_fy_intervals - n_intervals) / total_fy_intervals * 100
-                    start_val, end_val = first_val, last_val
-                    st_time, en_time = first_valid, last_valid
+                st_time, start_val, en_time, end_val, raw_diff = first_last_valid(y)
+                if pd.notna(raw_diff):
+                    covered_seconds = max((en_time - st_time).total_seconds(), 0)
+                    if covered_seconds >= min_valid_seconds and covered_seconds > 0:
+                        scaled_diff = raw_diff * (window_seconds / covered_seconds) if window_seconds > 0 else raw_diff
+                        percent_scaled = coverage_percent(covered_seconds)
 
             elif r2_num == -2:
-                # Stuck at start or end: remove stuck region, then use first/last remaining values
                 y = series.copy()
                 tokens = str(info).split()
                 stuck_len = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
@@ -410,74 +846,76 @@ def compute_meter_differences(
                     elif "end" in info:
                         y.iloc[-stuck_len:] = np.nan
 
-                valid = y.dropna()
-                if len(valid) >= 2:
-                    first_idx, last_idx = valid.index[0], valid.index[-1]
-                    first_val, last_val = valid.iloc[0], valid.iloc[-1]
-                    raw_diff = last_val - first_val
-                    n_intervals = y.index.get_loc(last_idx) - y.index.get_loc(first_idx)
-                    scaled_diff = raw_diff / n_intervals * total_fy_intervals
-                    percent_scaled = (total_fy_intervals - n_intervals) / total_fy_intervals * 100
-                    start_val, end_val = first_val, last_val
-                    st_time, en_time = first_idx, last_idx
+                st_time, start_val, en_time, end_val, raw_diff = first_last_valid(y)
+                if pd.notna(raw_diff):
+                    covered_seconds = max((en_time - st_time).total_seconds(), 0)
+                    if covered_seconds > 0:
+                        scaled_diff = raw_diff * (window_seconds / covered_seconds) if window_seconds > 0 else raw_diff
+                        percent_scaled = coverage_percent(covered_seconds)
 
             elif r2_num == -3:
-                # Meters with restart events (cumulative value drops during the year)
-                meter_restarts = df_restarts[df_restarts["meter_name"] == meter_name]
+                meter_restarts = (
+                    df_restarts[df_restarts["meter_name"] == meter_name]
+                    if df_restarts is not None and not df_restarts.empty
+                    else pd.DataFrame(columns=["meter_name", "previous_valid_time", "restart_time"])
+                )
                 restart_count = len(meter_restarts)
 
-                # If the number of restarts is above the threshold, skip usage reconstruction
                 if restart_count > restarts_thres:
                     raw_diff = scaled_diff = percent_scaled = np.nan
-
                 else:
-                    # Sort restart events in chronological order
                     meter_restarts = meter_restarts.sort_values("restart_time")
-
-                    # Remove consecutive duplicate readings (keeps only the first in each run)
                     clean_series = series.mask(series.eq(series.shift()))
-
-                    # Restrict data to the analysis window [start_time, end_time]
-                    meter_series = clean_series.loc[start_time:end_time]
-
-                    # Build segments between restart events where cumulative reading increases normally
                     periods = []
                     prev_time = start_time
 
                     for _, r in meter_restarts.iterrows():
-                        prev_valid = r["previous_valid_time"]
-                        restart_t = r["restart_time"]
+                        prev_valid = pd.to_datetime(r["previous_valid_time"])
+                        restart_t = pd.to_datetime(r["restart_time"])
 
-                        # Segment from previous segment start to last valid reading before restart
-                        if prev_time < prev_valid:
-                            periods.append((prev_time, prev_valid))
+                        if restart_t < start_time or prev_valid > end_time:
+                            continue
 
-                        prev_time = restart_t
+                        seg_start = max(prev_time, start_time)
+                        seg_end = min(prev_valid, end_time)
+                        if seg_start < seg_end:
+                            periods.append((seg_start, seg_end))
 
-                    # Final segment from last restart to the end of the analysis window
+                        prev_time = max(restart_t, start_time)
+
                     if prev_time < end_time:
                         periods.append((prev_time, end_time))
 
                     partial_sum = 0.0
                     partial_seconds = 0.0
+                    first_seg = None
+                    last_seg = None
 
-                    # Compute usage and elapsed time for all valid segments
                     for seg_start, seg_end in periods:
-                        start_val_seg = meter_series.asof(seg_start)
-                        end_val_seg = meter_series.asof(seg_end)
-                        if pd.notna(start_val_seg) and pd.notna(end_val_seg):
-                            partial_sum += (end_val_seg - start_val_seg)
-                            partial_seconds += (seg_end - seg_start).total_seconds()
+                        seg = clean_series.loc[(clean_series.index >= seg_start) & (clean_series.index <= seg_end)].dropna()
+                        if len(seg) < 2:
+                            continue
+                        start_seg_time = seg.index[0]
+                        end_seg_time = seg.index[-1]
+                        start_seg_val = seg.iloc[0]
+                        end_seg_val = seg.iloc[-1]
+                        partial_sum += (end_seg_val - start_seg_val)
+                        partial_seconds += max((end_seg_time - start_seg_time).total_seconds(), 0)
 
-                    # Scale partial usage to the full analysis window based on time coverage
-                    if partial_seconds > 0 and fy_seconds > 0:
-                        scaled_diff = partial_sum * (fy_seconds / partial_seconds)
-                        percent_scaled = (fy_seconds - partial_seconds) / fy_seconds * 100
+                        if first_seg is None:
+                            first_seg = (start_seg_time, start_seg_val)
+                        last_seg = (end_seg_time, end_seg_val)
 
-                    raw_diff = partial_sum
+                    if first_seg is not None and last_seg is not None:
+                        st_time, start_val = first_seg
+                        en_time, end_val = last_seg
+
+                    raw_diff = partial_sum if partial_seconds > 0 else np.nan
+                    if partial_seconds > 0 and window_seconds > 0:
+                        scaled_diff = partial_sum * (window_seconds / partial_seconds)
+                        percent_scaled = coverage_percent(partial_seconds)
 
             elif r2_num == -4 or r2_num > 0:
-                # Too few points, or positive R² but treated as bad without a correction rule
                 raw_diff = scaled_diff = percent_scaled = np.nan
 
         results.append((
@@ -673,57 +1111,107 @@ def plot_data(df, var, txt="original", fig_path="./"):
 ###################################################################
 
 def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=None):
+    # ===== ORIGINAL ZHILING / AURORA CODE (commented out) =====
+    #     """
+    #     Clean stuck points, apply special 'no_interp' corrections, and interpolate.
+    #     Restart intervals are set to 0 before interpolation.
+    #
+    #     Args:
+    #         column: pd.Series (time-indexed meter data)
+    #         flags: pd.Series of same length to track interpolated points
+    #         df_restarts: pd.DataFrame with columns ['meter_name', 'previous_valid_time', 'restart_time']
+    #         special_meters_file: Excel file with columns ['meter_name', 'start_datetime', 'end_datetime', 'solution']
+    #
+    #     Returns:
+    #         pd.Series: cleaned and interpolated column
+    #     """
+    #     column_cp = column.copy()
+    #
+    #     # STEP 0: Apply 'no_interp' periods from special_meters_file
+    #     if special_meters_file is not None:
+    #         bad_periods = pd.read_excel(special_meters_file)
+    #         bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
+    #         bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
+    #         bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
+    #         bad_periods["end_datetime"] = pd.to_datetime(bad_periods["end_datetime"])
+    #         # Only keep periods relevant for this column
+    #         bad_periods = bad_periods[
+    #             (bad_periods["meter_name"] == column.name) &
+    #             (bad_periods["solution"] == "no_interp")
+    #         ]
+    #
+    #         for _, row in bad_periods.iterrows():
+    #             start = row["start_datetime"]
+    #             end = row["end_datetime"]
+    #             mask = (column.index >= start) & (column.index <= end)
+    #             column.loc[mask] = 0  # replace with 0 for no_interp
+    #
+    #     # STEP 1: Remove stuck points (consecutive duplicates except 0)
+    #     mask_stuck = (column.duplicated(keep='first')) & (column != 0.)
+    #     column = column.mask(mask_stuck)
+    #
+    #     # STEP 2: Replace restart periods with 0
+    #     if df_restarts is not None and not df_restarts.empty:
+    #         restarts_for_col = df_restarts[df_restarts['meter_name'] == column.name]
+    #         for _, r in restarts_for_col.iterrows():
+    #             start = r['previous_valid_time']
+    #             end = r['restart_time']
+    #             column.loc[start:end] = 0
+    #
+    #     # STEP 3: Interpolate the entire column
+    #     column_interpolated = column.interpolate(method='linear')
+    #     column[:] = column_interpolated
+    #
+    #     # STEP 4: Update flags for interpolated values
+    #     changed_mask = (column_cp != column) & column.notna()
+    #     flags[:] = np.where(changed_mask, 1, flags)
+    #
+    #     return column
+
     """
-    Clean stuck points, apply special 'no_interp' corrections, and interpolate.
+    Clean stuck points, apply optional no_interp corrections, and interpolate.
     Restart intervals are set to 0 before interpolation.
-
-    Args:
-        column: pd.Series (time-indexed meter data)
-        flags: pd.Series of same length to track interpolated points
-        df_restarts: pd.DataFrame with columns ['meter_name', 'previous_valid_time', 'restart_time']
-        special_meters_file: Excel file with columns ['meter_name', 'start_datetime', 'end_datetime', 'solution']
-
-    Returns:
-        pd.Series: cleaned and interpolated column
     """
     column_cp = column.copy()
+    column = column.copy()
 
-    # STEP 0: Apply 'no_interp' periods from special_meters_file
-    if special_meters_file is not None:
+    if (
+        special_meters_file is not None
+        and str(special_meters_file).strip() != ""
+        and os.path.exists(special_meters_file)
+    ):
         bad_periods = pd.read_excel(special_meters_file)
-        bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
-        bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
-        bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
-        bad_periods["end_datetime"] = pd.to_datetime(bad_periods["end_datetime"])
-        # Only keep periods relevant for this column
-        bad_periods = bad_periods[
-            (bad_periods["meter_name"] == column.name) &
-            (bad_periods["solution"] == "no_interp")
-        ]
+        required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
+        if required_cols.issubset(set(bad_periods.columns)):
+            bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
+            bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
+            bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
+            bad_periods["end_datetime"] = pd.to_datetime(bad_periods["end_datetime"])
 
-        for _, row in bad_periods.iterrows():
-            start = row["start_datetime"]
-            end = row["end_datetime"]
-            mask = (column.index >= start) & (column.index <= end)
-            column.loc[mask] = 0  # replace with 0 for no_interp
+            bad_periods = bad_periods[
+                (bad_periods["meter_name"] == column.name) &
+                (bad_periods["solution"] == "no_interp")
+            ]
 
-    # STEP 1: Remove stuck points (consecutive duplicates except 0)
-    mask_stuck = (column.duplicated(keep='first')) & (column != 0.)
+            for _, row in bad_periods.iterrows():
+                start = row["start_datetime"]
+                end = row["end_datetime"]
+                mask = (column.index >= start) & (column.index <= end)
+                column.loc[mask] = 0
+
+    mask_stuck = (column.duplicated(keep="first")) & (column != 0.0)
     column = column.mask(mask_stuck)
 
-    # STEP 2: Replace restart periods with 0
     if df_restarts is not None and not df_restarts.empty:
-        restarts_for_col = df_restarts[df_restarts['meter_name'] == column.name]
+        restarts_for_col = df_restarts[df_restarts["meter_name"] == column.name]
         for _, r in restarts_for_col.iterrows():
-            start = r['previous_valid_time']
-            end = r['restart_time']
+            start = pd.to_datetime(r["previous_valid_time"])
+            end = pd.to_datetime(r["restart_time"])
             column.loc[start:end] = 0
 
-    # STEP 3: Interpolate the entire column
-    column_interpolated = column.interpolate(method='linear')
+    column_interpolated = column.interpolate(method="linear")
     column[:] = column_interpolated
 
-    # STEP 4: Update flags for interpolated values
     changed_mask = (column_cp != column) & column.notna()
     flags[:] = np.where(changed_mask, 1, flags)
 
@@ -800,20 +1288,21 @@ def reshape_interpolated_data(df, interpolation_flags):
 
 def save_file(data, fname, dname):
     """
-    Save a data file (data) to a specific location (dname) and filename (fname).
-    
+    Save a data file to a specific location and filename.
     Automatically overwrites any existing CSV file with the same name.
     """
-    # Ensure the directory exists
     if not os.path.exists(dname):
         os.mkdir(dname)
         print(f'Directory {dname} was created.')
-        
+
     fpath = os.path.join(dname, fname)
-    
-    # Automatically overwrite the file
+
     print(f'Writing file: "{fpath}"')
-    data.to_csv(fpath, index=False)
+    try:
+        data.to_csv(fpath, index=False)
+        print(f'File "{fpath}" saved successfully.')
+    except Exception as e:
+        print(f'Failed to save file: {e}')
 
     
 ###################################################################
