@@ -382,23 +382,6 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
                 "suggestion": "review_restart"
             })
 
-        # Unusually large positive jumps
-        pos_diffs = diffs[diffs > 0]
-        if not pos_diffs.empty:
-            median_diff = pos_diffs.median()
-            if pd.notna(median_diff) and median_diff > 0:
-                large_jumps = pos_diffs[pos_diffs > median_diff * jump_multiplier]
-                for t, diff_val in large_jumps.head(max_rows_per_meter).items():
-                    prev_idx = series.index[series.index.get_loc(t) - 1] if series.index.get_loc(t) > 0 else pd.NaT
-                    suggestions.append({
-                        "meter_name": meter,
-                        "issue_type": "large_jump",
-                        "start_datetime": prev_idx,
-                        "end_datetime": t,
-                        "details": f"Positive jump of {diff_val}, median positive jump {median_diff}.",
-                        "suggestion": "review_div100_or_remove"
-                    })
-
     if not suggestions:
         return pd.DataFrame(columns=[
             "meter_name", "issue_type", "start_datetime", "end_datetime", "details", "suggestion"
