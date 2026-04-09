@@ -47,69 +47,6 @@ def fill_missing_timestamps(df, freq):
     return full_df
 
 
-###################################################################
-###################################################################
-
-def prepare_meter_dataframe(df_long, value_col=None, freq=None, agg="last"):
-    """
-    Convert long format meter data (harvest processed data) into a wide 
-    datetime x meter dataframe.
-
-    Parameters:
-        df_long (pd.DataFrame): Must include datetime and meter_name, plus a value column.
-        value_col (str | None): Preferred numeric value column. Examples:
-            Aurora kwh: meter_reading
-            Harvest kwh: kwh
-            Aurora kw: mean
-            Harvest kw: mean_kw
-        freq (str | None): If provided, fill to a complete timestamp grid.
-        agg (str): Aggregation used when duplicate datetime/meter rows exist.
-
-    Returns:
-        pd.DataFrame with columns ['datetime', <meter columns...>]
-    """
-    if "datetime" not in df_long.columns or "meter_name" not in df_long.columns:
-        raise ValueError("Input long dataframe must contain 'datetime' and 'meter_name' columns.")
-
-    df_long = df_long.copy()
-    df_long["datetime"] = pd.to_datetime(df_long["datetime"])
-
-    candidate_cols = []
-    if value_col is not None:
-        candidate_cols.append(value_col)
-    candidate_cols.extend(["kwh", "mean_kw", "meter_reading", "mean", "kw"])
-
-    resolved_value_col = None
-    for col in candidate_cols:
-        if col in df_long.columns:
-            resolved_value_col = col
-            break
-
-    if resolved_value_col is None:
-        raise ValueError(
-            "Could not determine meter value column. Tried: "
-            + ", ".join(candidate_cols)
-        )
-
-    grouped = (
-        df_long
-        .groupby(["datetime", "meter_name"], as_index=False)[resolved_value_col]
-        .agg(agg)
-    )
-
-    pivoted_df = (
-        grouped
-        .pivot(index="datetime", columns="meter_name", values=resolved_value_col)
-        .reset_index()
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
-
-    if freq:
-        pivoted_df = fill_missing_timestamps(pivoted_df, freq)
-
-    return pivoted_df
-
 
 
 ###################################################################
@@ -165,7 +102,7 @@ def apply_special_meter_corrections(data, special_meters_file):
     """
     data_corrected = data.copy()
 
-    if special_meters_file is None or str(special_meters_file).strip() == "":
+    if special_meters_file is None or not os.path.exists(special_meters_file):
         print("No special meter file provided. Skipping manual corrections.")
         return data_corrected
 
