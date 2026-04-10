@@ -12,6 +12,12 @@ from openpyxl import load_workbook
 from typing import List, Tuple
 
 
+
+# 'broken' is treated like a removal-style correction in the endpoint workflow.
+ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
+
+
+
 ###################################################################
 ###################################################################
 
@@ -45,6 +51,46 @@ def fill_missing_timestamps(df, freq):
     # full_df = full_df.drop(full_df.index[-1])
     
     return full_df
+
+
+
+###################################################################
+###################################################################
+
+def resolve_analysis_window(index, start_time, end_time):
+    """
+    Check requested analysis timestamps to timestamps that
+    actually exist in the data index. This reduces failures when a user
+    selects times that are close to, but not exactly in, the filled index.
+    """
+    if index is None or len(index) == 0:
+        raise ValueError("Cannot resolve analysis window because the index is empty.")
+
+    idx = pd.DatetimeIndex(index).sort_values().unique()
+    start_time = pd.to_datetime(start_time)
+    end_time = pd.to_datetime(end_time)
+
+    if start_time > end_time:
+        raise ValueError("start_time must be <= end_time.")
+
+    if end_time < idx[0] or start_time > idx[-1]:
+        raise ValueError("Requested analysis window falls outside the data index.")
+
+    start_pos = idx.searchsorted(start_time, side="left")
+    end_pos = idx.searchsorted(end_time, side="right") - 1
+
+    if start_pos >= len(idx):
+        raise ValueError("Resolved start_time is outside the available index.")
+    if end_pos < 0:
+        raise ValueError("Resolved end_time is outside the available index.")
+    if start_pos > end_pos:
+        raise ValueError("Resolved analysis window contains no timestamps.")
+
+    resolved_start = idx[start_pos]
+    resolved_end = idx[end_pos]
+
+    return resolved_start, resolved_end
+
 
 
 
@@ -142,6 +188,7 @@ def apply_special_meter_corrections(data, special_meters_file):
             data_corrected.loc[mask, meter] = data_corrected.loc[mask, meter] / 100.0
         elif solution == "remove":
             data_corrected.loc[mask, meter] = np.nan
+        
 
     return data_corrected
 
