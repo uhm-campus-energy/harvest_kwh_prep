@@ -393,7 +393,7 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
                         "start_datetime": run_start,
                         "end_datetime": prev_time,
                         "details": f"Consecutive repeated values for {run_len} points.",
-                        "suggestion": "review/remove_or_no_interp"
+                        "suggestion": "remove_or_no_interp"
                     })
                     added_for_meter += 1
                     if added_for_meter >= max_rows_per_meter:
@@ -411,7 +411,7 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
                 "start_datetime": run_start,
                 "end_datetime": prev_time,
                 "details": f"Consecutive repeated values for {run_len} points.",
-                "suggestion": "review/remove_or_no_interp"
+                "suggestion": "remove_or_no_interp"
             })
 
         diffs = series.diff()
