@@ -13,7 +13,7 @@ from typing import List, Tuple
 
 
 
-# 'broken' is treated like a removal-style correction in the endpoint workflow.
+# 'broken' is treated like a removal style correction
 ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
 
 
@@ -510,7 +510,7 @@ def create_special_meters_workbook(
     ).reset_index(drop=True)
 
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        issue_df.to_excel(writer, sheet_name="meter_issues", index=False)
+        issue_df.to_excel(writer, sheet_name="timeframes", index=False)
 
         if df_bad_meters is not None:
             df_bad_meters.to_excel(writer, sheet_name="special_meter_summary", index=False)
