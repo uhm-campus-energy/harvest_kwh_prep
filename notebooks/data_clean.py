@@ -575,38 +575,34 @@ def plot_special_meters(data, special_meters, plot_file):
     """
     pdf_path = plot_file
     meters_ordered = special_meters["meter_name"].tolist()
-    data = data.copy()
-    data.index = pd.to_datetime(data.index, errors="coerce")
-    data = data[~data.index.isna()].sort_index()
 
     skipped_empty = 0
 
     with PdfPages(pdf_path) as pdf:
         for meter in meters_ordered:
-            if data.empty or meter not in data.columns:
-                skipped_empty += 1
-                continue
-
-            series = data[meter].dropna()
-            if series.empty:
+            # Skip if meter not in data
+            if meter not in data.columns:
                 skipped_empty += 1
                 continue
 
             row = special_meters[special_meters["meter_name"] == meter].iloc[0]
             r2_val, info = row["r2"], row["info"]
 
+            # Handle r2 whether it's numeric or string
             try:
                 r2_float = float(r2_val)
                 if r2_float > 0:
                     r2_text = f"R² = {r2_float:.4f}"
                 else:
+                    # for 0, -1, -2, -3 we show as integer
                     r2_text = f"R² = {int(r2_float)}"
             except (TypeError, ValueError):
+                # fallback if cannot parse as float
                 r2_text = f"R² = {r2_val}"
 
             plt.figure(figsize=(12, 3))
-            plt.plot(series.index, series.values)
-            plt.xlim(series.index.min(), series.index.max())
+            plt.plot(data.index, data[meter])
+            plt.xlim(data.index.min(), data.index.max())
             plt.title(meter)
             plt.xlabel("Datetime")
             plt.ylabel("kWh")
