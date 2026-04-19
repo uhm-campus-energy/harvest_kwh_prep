@@ -16,6 +16,11 @@ from typing import List, Tuple
 
 # 'broken' is treated like a removal style correction
 ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
+# TODO: add remove_meter option that allows auto rejection of all data from a meter
+# to master sheet with no start or end datetime and then make it auto remove that meter's
+# data in the loaded raw dataframe before any analysis or candidate generation steps. This would be for cases where a meter is completely unreliable and should be removed from consideration entirely.
+# also eileen if good idea
+# but maybe def use for the pv meters ect whatever
 
 
 
@@ -724,8 +729,7 @@ def sync_meter_corrections_master_sheet(
 
     if not approved_candidates.empty:
         approved_candidates = approved_candidates.rename(columns={
-            "issue_type/status": "issue_type/status",
-            "description": "description",
+            "issue_type/status": "issue_type/status"
         })
         approved_candidates = approved_candidates[
             ["meter_name", "solution", "start_datetime", "end_datetime", "issue_type/status", "description"]
@@ -804,9 +808,11 @@ def update_special_meter_candidates_workbook(
       fully explained by broken-meter windows
     - remove rows where approved == 1
     - generate new candidate rows from the current data
-    - include summary rows from df_bad_meters so missing start/end also show up
+    - convert missing-start / missing-end summary issues into real timeframe rows
+    - split missing_start_and_end into two rows
     - exclude all-NaN rows when the broken interval covers the full review window
     - exclude interval rows fully inside broken-meter intervals
+    - do not create blue missing rows for meters broken across the full window
     """
     window_start = pd.to_datetime(window_start)
     window_end = pd.to_datetime(window_end)
@@ -840,6 +846,67 @@ def update_special_meter_candidates_workbook(
             return "low_r2"
 
         return "summary_review"
+
+    def build_edge_missing_rows(meter_name, info_value, r2_value):
+        rows = []
+
+        if meter_name not in data.columns:
+            return rows
+
+        meter_series = data[meter_name].copy()
+        meter_series.index = pd.to_datetime(meter_series.index, errors="coerce")
+        meter_series = meter_series.sort_index().loc[window_start:window_end]
+
+        if meter_series.empty:
+            return rows
+
+        first_valid = meter_series.first_valid_index()
+        last_valid = meter_series.last_valid_index()
+        window_index = meter_series.index
+
+        if first_valid is None or last_valid is None:
+            return rows
+
+        first_pos = window_index.get_loc(first_valid)
+        last_pos = window_index.get_loc(last_valid)
+
+        if isinstance(first_pos, slice) or isinstance(last_pos, slice):
+            return rows
+
+        if isinstance(first_pos, np.ndarray):
+            first_pos = int(first_pos[0])
+        if isinstance(last_pos, np.ndarray):
+            last_pos = int(last_pos[0])
+
+        if info_value in {"missing start", "missing start and end"} and first_pos > 0:
+            last_missing_before_first_valid = window_index[first_pos - 1]
+            rows.append({
+                "meter_name": meter_name,
+                "solution": "",
+                "start_datetime": window_start,
+                "end_datetime": last_missing_before_first_valid,
+                "issue_type": "missing_start",
+                "description": "No valid data from analysis window start to last missing timestamp before first valid reading.",
+                "suggestion": "review_summary",
+                "r2": r2_value,
+                "approved": 0,
+            })
+
+        if info_value in {"missing end", "missing start and end"} and last_pos < len(window_index) - 1:
+            first_missing_after_last_valid = window_index[last_pos + 1]
+            rows.append({
+                "meter_name": meter_name,
+                "solution": "",
+                "start_datetime": first_missing_after_last_valid,
+                "end_datetime": window_end,
+                "issue_type": "missing_end",
+                "description": "No valid data from first missing timestamp after last valid reading to analysis window end.",
+                "suggestion": "review_summary",
+                "r2": r2_value,
+                "approved": 0,
+            })
+
+        return rows
 
     existing_candidates = _load_existing_candidates(candidate_file)
     unresolved_candidates = existing_candidates[
@@ -929,7 +996,7 @@ def update_special_meter_candidates_workbook(
     issue_df["approved"] = 0
 
     if df_bad_meters is not None and not df_bad_meters.empty:
-        meta = df_bad_meters.rename(columns={"r2": "r2"}).copy()
+        meta = df_bad_meters.copy()
         meta["meter_name"] = meta["meter_name"].apply(_normalize_text)
         meta = meta[["meter_name", "r2"]]
         issue_df = issue_df.merge(meta, on="meter_name", how="left")
@@ -974,32 +1041,36 @@ def update_special_meter_candidates_workbook(
     summary_rows = pd.DataFrame(columns=candidate_cols)
 
     if df_bad_meters is not None and not df_bad_meters.empty:
-        summary_rows = df_bad_meters.copy()
-        summary_rows["meter_name"] = summary_rows["meter_name"].apply(_normalize_text)
-        summary_rows["solution"] = ""
-        summary_rows["start_datetime"] = pd.NaT
-        summary_rows["end_datetime"] = pd.NaT
-        summary_rows["issue_type"] = summary_rows["info"].apply(summary_info_to_issue_type)
-        summary_rows["description"] = summary_rows["info"]
-        summary_rows["suggestion"] = "review_summary"
-        summary_rows["r2"] = summary_rows["r2"]
-        summary_rows["approved"] = 0
+        summary_df = df_bad_meters.copy()
+        summary_df["meter_name"] = summary_df["meter_name"].apply(_normalize_text)
+        summary_df["issue_type"] = summary_df["info"].apply(summary_info_to_issue_type)
 
-        # keep summary rows only for summary-type issues that are useful here
-        summary_rows = summary_rows[
-            summary_rows["issue_type"].isin({
-                "missing_start",
-                "missing_end",
-                "missing_start_and_end",
-                "low_r2",
-                "too_few_points",
-            })
-        ].copy()
+        summary_row_list = []
+        for row in summary_df.itertuples(index=False):
+            meter_name = row.meter_name
+            issue_type = row.issue_type
+            info_value = str(row.info).strip().lower()
+            r2_value = row.r2
 
-        for col in candidate_cols:
-            if col not in summary_rows.columns:
-                summary_rows[col] = np.nan if col not in {"solution", "description", "suggestion"} else ""
+            if meter_name in fully_broken_meters and issue_type in {"all_nan", "missing_start", "missing_end", "missing_start_and_end"}:
+                continue
 
+            if issue_type in {"missing_start", "missing_end", "missing_start_and_end"}:
+                summary_row_list.extend(build_edge_missing_rows(meter_name, info_value, r2_value))
+            elif issue_type in {"low_r2", "too_few_points"}:
+                summary_row_list.append({
+                    "meter_name": meter_name,
+                    "solution": "",
+                    "start_datetime": pd.NaT,
+                    "end_datetime": pd.NaT,
+                    "issue_type": issue_type,
+                    "description": str(row.info),
+                    "suggestion": "review_summary",
+                    "r2": r2_value,
+                    "approved": 0,
+                })
+
+        summary_rows = pd.DataFrame(summary_row_list, columns=candidate_cols)
         summary_rows = summary_rows.reindex(columns=candidate_cols)
 
     combined_candidates = pd.concat(
@@ -1043,10 +1114,28 @@ def update_special_meter_candidates_workbook(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    filtered_special_meter_summary = None
+    if df_bad_meters is not None:
+        filtered_special_meter_summary = df_bad_meters.copy()
+        filtered_special_meter_summary["meter_name"] = filtered_special_meter_summary["meter_name"].apply(_normalize_text)
+        filtered_special_meter_summary["_issue_type"] = filtered_special_meter_summary["info"].apply(summary_info_to_issue_type)
+        filtered_special_meter_summary = filtered_special_meter_summary[
+            ~(
+                filtered_special_meter_summary["meter_name"].isin(fully_broken_meters)
+                & filtered_special_meter_summary["_issue_type"].isin({
+                    "all_nan",
+                    "missing_start",
+                    "missing_end",
+                    "missing_start_and_end",
+                })
+            )
+        ].copy()
+        filtered_special_meter_summary = filtered_special_meter_summary.drop(columns=["_issue_type"])
+
     with pd.ExcelWriter(candidate_file, engine="openpyxl") as writer:
         combined_candidates.to_excel(writer, sheet_name="timeframes", index=False)
-        if df_bad_meters is not None:
-            df_bad_meters.to_excel(writer, sheet_name="special_meter_summary", index=False)
+        if filtered_special_meter_summary is not None:
+            filtered_special_meter_summary.to_excel(writer, sheet_name="special_meter_summary", index=False)
         if df_restarts is not None:
             df_restarts.to_excel(writer, sheet_name="restarts", index=False)
 
@@ -1303,6 +1392,10 @@ def plot_review_meters_with_overlays(
 
     Red spans  = broken-meter intervals from the broken-meter workbook
     Blue spans = candidate intervals from the candidate workbook
+
+    The plot annotation box shows:
+    - issue_type first
+    - then R² text if present
     """
     if data is None or data.empty:
         raise ValueError("data is empty.")
@@ -1314,8 +1407,7 @@ def plot_review_meters_with_overlays(
     data_start = pd.to_datetime(data.index.min())
     data_end = pd.to_datetime(data.index.max())
 
-    candidate_df = _load_existing_candidates(candidate_file)
-    candidate_df = candidate_df[["meter_name", "start_datetime", "end_datetime"]].copy()
+    candidate_df = _load_existing_candidates(candidate_file).copy()
 
     broken_source_df = load_broken_meter_workbook(broken_meters_file)
     broken_plot_rows = []
@@ -1347,6 +1439,17 @@ def plot_review_meters_with_overlays(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    def format_r2_value(r2_val):
+        if pd.isna(r2_val):
+            return ""
+        try:
+            r2_float = float(r2_val)
+            if r2_float > 0:
+                return f"R² = {r2_float:.4f}"
+            return f"R² = {int(r2_float)}"
+        except (TypeError, ValueError):
+            return f"R² = {r2_val}"
+
     with PdfPages(plot_file) as pdf:
         for meter in review_meters:
             fig, ax = plt.subplots(figsize=(12, 3))
@@ -1361,10 +1464,38 @@ def plot_review_meters_with_overlays(
             for _, row in meter_broken.iterrows():
                 ax.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
 
-            meter_candidates = candidate_df[candidate_df["meter_name"] == meter]
+            meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
             for _, row in meter_candidates.iterrows():
                 if pd.notna(row["start_datetime"]) and pd.notna(row["end_datetime"]):
                     ax.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="blue")
+
+            issue_types = [
+                str(value).strip()
+                for value in pd.unique(meter_candidates["issue_type"].dropna())
+                if str(value).strip() != ""
+            ]
+
+            r2_values = []
+            for value in pd.unique(meter_candidates["r2"].dropna()):
+                formatted = format_r2_value(value)
+                if formatted != "":
+                    r2_values.append(formatted)
+
+            annotation_lines = []
+            if issue_types:
+                annotation_lines.append("Issue type: " + ", ".join(issue_types))
+            if r2_values:
+                annotation_lines.append(", ".join(r2_values))
+
+            if annotation_lines:
+                ax.text(
+                    0.05, 0.95,
+                    "\n".join(annotation_lines),
+                    transform=ax.transAxes,
+                    ha="left", va="top",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
+                )
 
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
@@ -1373,79 +1504,21 @@ def plot_review_meters_with_overlays(
 
 
 
+
 ###################################################################
 ###################################################################
 
 def plot_special_meters(data, special_meters, plot_file):
-    # """
-    # Plot time series for bad meters and save to a PDF.
+    # CHANGED: deprecated because the review overlay PDF now replaces the special-meter PDF.
+    # Keeping this function as a no-op avoids breaking any older notebook cells.
+    """
+    Deprecated.
 
-    # Args:
-    #     data (pd.DataFrame): Time-series data, each column is a meter_name.
-    #     bad_meters (pd.DataFrame): Has columns ['meter_name', 'r2', 'info'].
-    #     plot_file (str): Output PDF file path.
-    # """
-    # pdf_path = plot_file
-    # meters_ordered = bad_meters["meter_name"].tolist()
-    # non_val_count = 0
-    # not_in_data_count = 0
-    # val_count = 0
+    Use plot_review_meters_with_overlays(...) instead.
+    """
+    print("plot_special_meters is deprecated. Use plot_review_meters_with_overlays instead.")
+    return
 
-    # with PdfPages(pdf_path) as pdf:
-    #     for meter in meters_ordered:
-    #         if data.empty or data.index.isna().all():
-    #             non_val_count += 1
-    #             continue
-
-    #         # Skip if meter not in data
-    #         if meter not in data.columns:
-    #             not_in_data_count += 1
-    #             continue
-
-    #         val_count += 1
-
-    #         row = bad_meters[bad_meters["meter_name"] == meter].iloc[0]
-    #         r2_val, info = row["r2"], row["info"]
-
-    #         # Handle r2 whether it's numeric or string
-    #         try:
-    #             r2_float = float(r2_val)
-    #             if r2_float > 0:
-    #                 r2_text = f"R² = {r2_float:.4f}"
-    #             else:
-    #                 # for 0, -1, -2, -3 we show as integer
-    #                 r2_text = f"R² = {int(r2_float)}"
-    #         except (TypeError, ValueError):
-    #             # fallback if cannot parse as float
-    #             r2_text = f"R² = {r2_val}"
-
-    #         plt.figure(figsize=(12, 3))
-    #         plt.plot(data.index, data[meter])
-    #         plt.xlim(data.index.min(), data.index.max())
-    #         plt.title(meter)
-    #         plt.xlabel("Datetime")
-    #         plt.ylabel("kWh")
-    #         plt.grid(True)
-
-    #         plt.text(
-    #             0.05, 0.95,
-    #             f"{r2_text}\n{info}",
-    #             transform=plt.gca().transAxes,
-    #             ha="left", va="top",
-    #             fontsize=9,
-    #             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
-    #         )
-
-    #         plt.tight_layout()
-    #         pdf.savefig()
-    #         plt.close()
-    # if non_val_count > 0:
-    #     print(f"Skipped plotting for {non_val_count} meters due to no valid data.")
-    # if not_in_data_count > 0:
-    #     print(f"Skipped plotting for {not_in_data_count} meters not found in data.")
-    # if val_count > 0:
-    #     print(f"Plotted {val_count} special meters.")
-    #     print(f"Special meter plots saved to {pdf_path}")
     """
     Plot time series for special meters and save to a PDF.
 
