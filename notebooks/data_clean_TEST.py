@@ -15,6 +15,7 @@ from typing import List, Tuple
 
 
 # 'broken' is treated like a removal style correction
+ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
 BROKEN_STATUS_VALUES = {"broken", "repaired", "under_renovation", "no_meter"}
 
 
@@ -543,8 +544,6 @@ def create_special_meters_workbook(
 ###################################################################
 ###################################################################
 
-BROKEN_STATUS_VALUES = {"broken", "repaired", "under_renovation"}
-
 
 # CHANGED: added one shared text normalizer for the broken-meter workflow.
 def _normalize_text(value, underscore=False):
@@ -605,7 +604,6 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
 
     df["meter_name"] = df["meter_name"].apply(_normalize_text)
     df["status"] = df["status"].apply(lambda x: _normalize_text(x, underscore=True))
-    df["status"] = df["status"].replace({"no_meter": "under_renovation"})
     df["description"] = df["description"].apply(_normalize_text)
     df["data_source"] = df["data_source"].apply(_normalize_text)
     df["updated_data"] = pd.to_datetime(df["updated_data"], errors="coerce", dayfirst=dayfirst)
@@ -758,9 +756,8 @@ def sync_meter_corrections_master_sheet(
     ].copy()
 
     if not approved_candidates.empty:
-        approved_candidates = approved_candidates.rename(columns={
-            "issue_type/status": "issue_type/status"
-        })
+        if "issue_type" in approved_candidates.columns and "issue_type/status" not in approved_candidates.columns:
+            approved_candidates = approved_candidates.rename(columns={"issue_type": "issue_type/status"})
         approved_candidates = approved_candidates[
             ["meter_name", "solution", "start_datetime", "end_datetime", "issue_type/status", "description"]
         ].copy()
