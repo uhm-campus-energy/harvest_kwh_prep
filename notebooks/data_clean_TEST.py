@@ -1073,11 +1073,13 @@ def update_special_meter_candidates_workbook(
 
     summary_rows = pd.DataFrame(columns=candidate_cols)
 
+    filtered_special_meter_summary = pd.DataFrame(columns=["meter_name", "r2", "info"])
     if df_bad_meters is not None and not df_bad_meters.empty:
         summary_df = df_bad_meters.copy()
         summary_df["meter_name"] = summary_df["meter_name"].apply(_normalize_text)
         summary_df["issue_type"] = summary_df["info"].apply(summary_info_to_issue_type)
 
+        filtered_special_meter_summary = summary_df[
         summary_row_list = []
         for row in summary_df.itertuples(index=False):
             meter_name = row.meter_name
