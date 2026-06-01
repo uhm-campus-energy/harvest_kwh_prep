@@ -1080,6 +1080,17 @@ def update_special_meter_candidates_workbook(
         summary_df["issue_type"] = summary_df["info"].apply(summary_info_to_issue_type)
 
         filtered_special_meter_summary = summary_df[
+            ~(
+                summary_df["meter_name"].isin(fully_broken_meters)
+                & summary_df["issue_type"].isin({
+                    "all_nan",
+                    "missing_start",
+                    "missing_end",
+                    "missing_start_and_end",
+                })
+            )
+        ].copy()[["meter_name", "r2", "info"]]
+
         summary_row_list = []
         for row in summary_df.itertuples(index=False):
             meter_name = row.meter_name
@@ -1149,10 +1160,12 @@ def update_special_meter_candidates_workbook(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    combined_candidates = combined_candidates.reindex(columns=candidate_cols)
+
     with pd.ExcelWriter(candidate_file, engine="openpyxl") as writer:
         combined_candidates.to_excel(writer, sheet_name="timeframes", index=False)
         if df_bad_meters is not None:
-            df_bad_meters.to_excel(writer, sheet_name="special_meter_summary", index=False)
+            filtered_special_meter_summary.to_excel(writer, sheet_name="special_meter_summary", index=False)
         if df_restarts is not None:
             df_restarts.to_excel(writer, sheet_name="restarts", index=False)
 
@@ -1409,6 +1422,10 @@ def plot_review_meters_with_overlays(
 
     Red spans  = broken-meter intervals from the broken-meter workbook
     Blue spans = candidate intervals from the candidate workbook
+
+    The plot annotation box shows:
+    - issue_type first
+    - then R² text if present
     """
     if data is None or data.empty:
         raise ValueError("data is empty.")
@@ -1420,8 +1437,7 @@ def plot_review_meters_with_overlays(
     data_start = pd.to_datetime(data.index.min())
     data_end = pd.to_datetime(data.index.max())
 
-    candidate_df = _load_existing_candidates(candidate_file)
-    candidate_df = candidate_df[["meter_name", "start_datetime", "end_datetime"]].copy()
+    candidate_df = _load_existing_candidates(candidate_file).copy()
 
     broken_source_df = load_broken_meter_workbook(broken_meters_file)
     broken_plot_rows = []
@@ -1453,6 +1469,17 @@ def plot_review_meters_with_overlays(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    def format_r2_value(r2_val):
+        if pd.isna(r2_val):
+            return ""
+        try:
+            r2_float = float(r2_val)
+            if r2_float > 0:
+                return f"R² = {r2_float:.4f}"
+            return f"R² = {int(r2_float)}"
+        except (TypeError, ValueError):
+            return f"R² = {r2_val}"
+
     with PdfPages(plot_file) as pdf:
         for meter in review_meters:
             fig, ax = plt.subplots(figsize=(12, 3))
@@ -1467,10 +1494,37 @@ def plot_review_meters_with_overlays(
             for _, row in meter_broken.iterrows():
                 ax.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
 
-            meter_candidates = candidate_df[candidate_df["meter_name"] == meter]
+            meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
             for _, row in meter_candidates.iterrows():
                 if pd.notna(row["start_datetime"]) and pd.notna(row["end_datetime"]):
                     ax.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="blue")
+
+            issue_types = [
+                str(value).strip()
+                for value in pd.unique(meter_candidates["issue_type"].dropna())
+                if str(value).strip() != ""
+            ]
+            r2_values = [
+                format_r2_value(value)
+                for value in pd.unique(meter_candidates["r2"].dropna())
+                if format_r2_value(value) != ""
+            ]
+
+            annotation_lines = []
+            if issue_types:
+                annotation_lines.append("Issue type: " + ", ".join(issue_types))
+            if r2_values:
+                annotation_lines.append(", ".join(r2_values))
+
+            if annotation_lines:
+                ax.text(
+                    0.05, 0.95,
+                    "\n".join(annotation_lines),
+                    transform=ax.transAxes,
+                    ha="left", va="top",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
+                )
 
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
@@ -1483,75 +1537,15 @@ def plot_review_meters_with_overlays(
 ###################################################################
 
 def plot_special_meters(data, special_meters, plot_file):
-    # """
-    # Plot time series for bad meters and save to a PDF.
+    # CHANGED: deprecated because the review overlay PDF now replaces the special-meter PDF.
+    # Keeping this function as a no-op avoids breaking any older notebook cells.
+    """
+    Deprecated.
 
-    # Args:
-    #     data (pd.DataFrame): Time-series data, each column is a meter_name.
-    #     bad_meters (pd.DataFrame): Has columns ['meter_name', 'r2', 'info'].
-    #     plot_file (str): Output PDF file path.
-    # """
-    # pdf_path = plot_file
-    # meters_ordered = bad_meters["meter_name"].tolist()
-    # non_val_count = 0
-    # not_in_data_count = 0
-    # val_count = 0
-
-    # with PdfPages(pdf_path) as pdf:
-    #     for meter in meters_ordered:
-    #         if data.empty or data.index.isna().all():
-    #             non_val_count += 1
-    #             continue
-
-    #         # Skip if meter not in data
-    #         if meter not in data.columns:
-    #             not_in_data_count += 1
-    #             continue
-
-    #         val_count += 1
-
-    #         row = bad_meters[bad_meters["meter_name"] == meter].iloc[0]
-    #         r2_val, info = row["r2"], row["info"]
-
-    #         # Handle r2 whether it's numeric or string
-    #         try:
-    #             r2_float = float(r2_val)
-    #             if r2_float > 0:
-    #                 r2_text = f"R² = {r2_float:.4f}"
-    #             else:
-    #                 # for 0, -1, -2, -3 we show as integer
-    #                 r2_text = f"R² = {int(r2_float)}"
-    #         except (TypeError, ValueError):
-    #             # fallback if cannot parse as float
-    #             r2_text = f"R² = {r2_val}"
-
-    #         plt.figure(figsize=(12, 3))
-    #         plt.plot(data.index, data[meter])
-    #         plt.xlim(data.index.min(), data.index.max())
-    #         plt.title(meter)
-    #         plt.xlabel("Datetime")
-    #         plt.ylabel("kWh")
-    #         plt.grid(True)
-
-    #         plt.text(
-    #             0.05, 0.95,
-    #             f"{r2_text}\n{info}",
-    #             transform=plt.gca().transAxes,
-    #             ha="left", va="top",
-    #             fontsize=9,
-    #             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
-    #         )
-
-    #         plt.tight_layout()
-    #         pdf.savefig()
-    #         plt.close()
-    # if non_val_count > 0:
-    #     print(f"Skipped plotting for {non_val_count} meters due to no valid data.")
-    # if not_in_data_count > 0:
-    #     print(f"Skipped plotting for {not_in_data_count} meters not found in data.")
-    # if val_count > 0:
-    #     print(f"Plotted {val_count} special meters.")
-    #     print(f"Special meter plots saved to {pdf_path}")
+    Use plot_review_meters_with_overlays(...) instead.
+    """
+    print("plot_special_meters is deprecated. Use plot_review_meters_with_overlays instead.")
+    return
     """
     Plot time series for special meters and save to a PDF.
 
