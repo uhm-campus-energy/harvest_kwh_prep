@@ -209,6 +209,160 @@ def apply_special_meter_corrections(data, special_meters_file):
     return data_corrected
 
 
+def export_removed_special_meter_data(
+    data,
+    special_meters_file,
+    output_csv=None,
+    export_solutions=None,
+):
+    """
+    Export raw meter readings that fall inside remove/broken correction windows.
+
+    This function does not modify the input data. It preserves the raw values
+    that would later be removed from the working dataframe.
+
+    Args:
+        data (pd.DataFrame): Wide meter dataframe with a DatetimeIndex.
+        special_meters_file (str): Excel file with correction rows.
+        output_csv (str or None): Optional CSV output path.
+        export_solutions (set/list/tuple or None): Solutions to export.
+            Defaults to {"remove", "broken"}.
+
+    Returns:
+        pd.DataFrame: Long-format exported rows with correction metadata.
+    """
+    export_cols = [
+        "datetime",
+        "meter_name",
+        "meter_reading",
+        "solution",
+        "correction_start",
+        "correction_end",
+        "issue_type/status",
+        "description",
+    ]
+
+    if export_solutions is None:
+        export_solutions = {"remove", "broken"}
+
+    export_solutions = {
+        str(value).strip().lower()
+        for value in export_solutions
+        if str(value).strip() != ""
+    }
+
+    if data is None or data.empty or len(data.index) == 0:
+        export_df = pd.DataFrame(columns=export_cols)
+        if output_csv is not None and str(output_csv).strip() != "":
+            output_dir = os.path.dirname(str(output_csv))
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            export_df.to_csv(output_csv, index=False)
+            print(f"Removed special meter data exported to {output_csv}")
+        return export_df
+
+    if special_meters_file is None or not os.path.exists(special_meters_file):
+        print("No special meter file provided. Skipping removed-data export.")
+        return pd.DataFrame(columns=export_cols)
+
+    correction_df = pd.read_excel(special_meters_file)
+
+    required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
+    missing_cols = required_cols.difference(set(correction_df.columns))
+    if missing_cols:
+        raise ValueError(
+            "Special meter file is missing required columns: "
+            + ", ".join(sorted(missing_cols))
+        )
+
+    if "issue_type" in correction_df.columns and "issue_type/status" not in correction_df.columns:
+        correction_df = correction_df.rename(columns={"issue_type": "issue_type/status"})
+    if "status" in correction_df.columns and "issue_type/status" not in correction_df.columns:
+        correction_df = correction_df.rename(columns={"status": "issue_type/status"})
+
+    if "issue_type/status" not in correction_df.columns:
+        correction_df["issue_type/status"] = ""
+    if "description" not in correction_df.columns:
+        correction_df["description"] = ""
+
+    correction_df = correction_df.copy()
+    correction_df["meter_name"] = correction_df["meter_name"].astype(str).str.strip()
+    correction_df["solution"] = correction_df["solution"].astype(str).str.strip().str.lower()
+    correction_df["start_datetime"] = pd.to_datetime(correction_df["start_datetime"], errors="coerce")
+    correction_df["end_datetime"] = pd.to_datetime(correction_df["end_datetime"], errors="coerce")
+    correction_df["issue_type/status"] = correction_df["issue_type/status"].fillna("").astype(str).str.strip()
+    correction_df["description"] = correction_df["description"].fillna("").astype(str).str.strip()
+
+    correction_df = correction_df[
+        correction_df["meter_name"].isin(data.columns)
+        & correction_df["solution"].isin(export_solutions)
+    ].copy()
+
+    if correction_df.empty:
+        export_df = pd.DataFrame(columns=export_cols)
+        if output_csv is not None and str(output_csv).strip() != "":
+            output_dir = os.path.dirname(str(output_csv))
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            export_df.to_csv(output_csv, index=False)
+            print(f"Removed special meter data exported to {output_csv}")
+        return export_df
+
+    data_start = pd.to_datetime(data.index.min())
+    data_end = pd.to_datetime(data.index.max())
+
+    export_frames = []
+
+    for _, row in correction_df.iterrows():
+        meter = row["meter_name"]
+        start = row["start_datetime"]
+        end = row["end_datetime"]
+
+        if pd.isna(start):
+            start = data_start
+        if pd.isna(end):
+            end = data_end
+
+        start = max(pd.to_datetime(start), data_start)
+        end = min(pd.to_datetime(end), data_end)
+
+        if start > end:
+            continue
+
+        meter_series = data.loc[(data.index >= start) & (data.index <= end), meter]
+        if meter_series.empty:
+            continue
+
+        export_piece = meter_series.rename("meter_reading").reset_index()
+        export_piece.columns = ["datetime", "meter_reading"]
+        export_piece["meter_name"] = meter
+        export_piece["solution"] = row["solution"]
+        export_piece["correction_start"] = row["start_datetime"]
+        export_piece["correction_end"] = row["end_datetime"]
+        export_piece["issue_type/status"] = row["issue_type/status"]
+        export_piece["description"] = row["description"]
+
+        export_frames.append(export_piece)
+
+    if export_frames:
+        export_df = pd.concat(export_frames, ignore_index=True, sort=False)
+        export_df = export_df.reindex(columns=export_cols)
+        export_df = export_df.sort_values(
+            by=["meter_name", "datetime", "solution"],
+            na_position="last",
+        ).reset_index(drop=True)
+    else:
+        export_df = pd.DataFrame(columns=export_cols)
+
+    if output_csv is not None and str(output_csv).strip() != "":
+        output_dir = os.path.dirname(str(output_csv))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        export_df.to_csv(output_csv, index=False)
+        print(f"Removed special meter data exported to {output_csv}")
+
+    return export_df
+
 
 
 ###################################################################
@@ -544,8 +698,7 @@ def create_special_meters_workbook(
 ###################################################################
 ###################################################################
 
-
-# CHANGED: added one shared text normalizer for the broken-meter workflow.
+# shared text normalizer for the broken meter workflow.
 def _normalize_text(value, underscore=False):
     if pd.isna(value):
         return ""
@@ -560,7 +713,7 @@ def _normalize_text(value, underscore=False):
     return value
 
 
-# CHANGED: added loader for the broken-meter workbook with simple normalization and day-first dates.
+# loader for the broken meter workbook with simple normalization and day-first dates.
 def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
     """
     Load and normalize the running broken meter workbook.
@@ -604,6 +757,7 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
 
     df["meter_name"] = df["meter_name"].apply(_normalize_text)
     df["status"] = df["status"].apply(lambda x: _normalize_text(x, underscore=True))
+    # df["status"] = df["status"].replace({"no_meter": "under_renovation"})
     df["description"] = df["description"].apply(_normalize_text)
     df["data_source"] = df["data_source"].apply(_normalize_text)
     df["updated_data"] = pd.to_datetime(df["updated_data"], errors="coerce", dayfirst=dayfirst)
@@ -756,8 +910,9 @@ def sync_meter_corrections_master_sheet(
     ].copy()
 
     if not approved_candidates.empty:
-        if "issue_type" in approved_candidates.columns and "issue_type/status" not in approved_candidates.columns:
-            approved_candidates = approved_candidates.rename(columns={"issue_type": "issue_type/status"})
+        approved_candidates = approved_candidates.rename(columns={
+            "issue_type/status": "issue_type/status"
+        })
         approved_candidates = approved_candidates[
             ["meter_name", "solution", "start_datetime", "end_datetime", "issue_type/status", "description"]
         ].copy()
@@ -823,7 +978,7 @@ def sync_meter_corrections_master_sheet(
 
 
 
-# CHANGED: added candidate workbook updater for unresolved review rows and new detected issues.
+# candidate workbook updater for unresolved review rows and new detected issues
 def update_special_meter_candidates_workbook(
     data,
     candidate_file,
@@ -834,8 +989,6 @@ def update_special_meter_candidates_workbook(
     df_restarts=None,
 ):
     """
-    CHANGED: update the candidate review workbook.
-
     Rules:
     - keep unresolved existing candidate rows, except stale rows that are now
       fully explained by broken-meter windows
@@ -1074,6 +1227,7 @@ def update_special_meter_candidates_workbook(
     summary_rows = pd.DataFrame(columns=candidate_cols)
 
     filtered_special_meter_summary = pd.DataFrame(columns=["meter_name", "r2", "info"])
+
     if df_bad_meters is not None and not df_bad_meters.empty:
         summary_df = df_bad_meters.copy()
         summary_df["meter_name"] = summary_df["meter_name"].apply(_normalize_text)
@@ -1160,12 +1314,10 @@ def update_special_meter_candidates_workbook(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    combined_candidates = combined_candidates.reindex(columns=candidate_cols)
-
     with pd.ExcelWriter(candidate_file, engine="openpyxl") as writer:
         combined_candidates.to_excel(writer, sheet_name="timeframes", index=False)
         if df_bad_meters is not None:
-            filtered_special_meter_summary.to_excel(writer, sheet_name="special_meter_summary", index=False)
+            df_bad_meters.to_excel(writer, sheet_name="special_meter_summary", index=False)
         if df_restarts is not None:
             df_restarts.to_excel(writer, sheet_name="restarts", index=False)
 
@@ -1409,24 +1561,16 @@ def plot_all_meters_to_pdf(data, plot_file, ylabel="meter_reading"):
     print(f"All-meter plots saved to {plot_file}")
 
 
-# CHANGED: added review plotting with red broken-meter overlays and blue candidate overlays.
+
+# review plotting with red broken-meter overlays and blue candidate overlays.
 def plot_review_meters_with_overlays(
     data,
     candidate_file,
     broken_meters_file,
     plot_file,
     ylabel="kWh",
-):
-    """
-    Plot review meters with overlay windows.
-
-    Red spans  = broken-meter intervals from the broken-meter workbook
-    Blue spans = candidate intervals from the candidate workbook
-
-    The plot annotation box shows:
-    - issue_type first
-    - then R² text if present
-    """
+    ):
+    
     if data is None or data.empty:
         raise ValueError("data is empty.")
 
@@ -1451,10 +1595,7 @@ def plot_review_meters_with_overlays(
                 "end_datetime": end,
             })
 
-    broken_df = pd.DataFrame(
-        broken_plot_rows,
-        columns=["meter_name", "start_datetime", "end_datetime"]
-    )
+    broken_df = pd.DataFrame(broken_plot_rows, columns=["meter_name", "start_datetime", "end_datetime"])
 
     review_meters = sorted(
         (set(candidate_df["meter_name"]) | set(broken_df["meter_name"]))
@@ -1482,22 +1623,22 @@ def plot_review_meters_with_overlays(
 
     with PdfPages(plot_file) as pdf:
         for meter in review_meters:
-            fig, ax = plt.subplots(figsize=(12, 3))
-            ax.plot(data.index, data[meter], linewidth=1.2)
-            ax.set_xlim(data_start, data_end)
-            ax.set_title(meter)
-            ax.set_xlabel("Datetime")
-            ax.set_ylabel(ylabel)
-            ax.grid(True, alpha=0.3)
+            plt.figure(figsize=(12, 3))
+            plt.plot(data.index, data[meter], linewidth=1.2)
+            plt.xlim(data_start, data_end)
+            plt.title(meter)
+            plt.xlabel("Datetime")
+            plt.ylabel(ylabel)
+            plt.grid(True, alpha=0.3)
 
             meter_broken = broken_df[broken_df["meter_name"] == meter]
             for _, row in meter_broken.iterrows():
-                ax.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
+                plt.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
 
             meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
             for _, row in meter_candidates.iterrows():
                 if pd.notna(row["start_datetime"]) and pd.notna(row["end_datetime"]):
-                    ax.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="blue")
+                    plt.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="blue")
 
             issue_types = [
                 str(value).strip()
@@ -1517,17 +1658,18 @@ def plot_review_meters_with_overlays(
                 annotation_lines.append(", ".join(r2_values))
 
             if annotation_lines:
-                ax.text(
+                plt.text(
                     0.05, 0.95,
                     "\n".join(annotation_lines),
-                    transform=ax.transAxes,
+                    transform=plt.gca().transAxes,
                     ha="left", va="top",
                     fontsize=9,
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
                 )
 
-            pdf.savefig(fig, bbox_inches="tight")
-            plt.close(fig)
+            plt.tight_layout()
+            pdf.savefig()
+            plt.close()
 
     print(f"Review overlay plots saved to {plot_file}")
 
@@ -1537,8 +1679,8 @@ def plot_review_meters_with_overlays(
 ###################################################################
 
 def plot_special_meters(data, special_meters, plot_file):
-    # CHANGED: deprecated because the review overlay PDF now replaces the special-meter PDF.
-    # Keeping this function as a no-op avoids breaking any older notebook cells.
+    # deprecated because the review overlay PDF now replaces the special-meter PDF.
+    # keeping this function as a no-op avoids breaking any older notebook cells.
     """
     Deprecated.
 
@@ -1546,65 +1688,65 @@ def plot_special_meters(data, special_meters, plot_file):
     """
     print("plot_special_meters is deprecated. Use plot_review_meters_with_overlays instead.")
     return
-    """
-    Plot time series for special meters and save to a PDF.
+    # """
+    # Plot time series for special meters and save to a PDF.
 
-    Args:
-        data (pd.DataFrame): Time-series data, each column is a meter_name.
-        special_meters (pd.DataFrame): Has columns ['meter_name', 'r2', 'info'].
-        plot_file (str): Output PDF file path.
-    """
-    pdf_path = plot_file
-    meters_ordered = special_meters["meter_name"].tolist()
+    # Args:
+    #     data (pd.DataFrame): Time-series data, each column is a meter_name.
+    #     special_meters (pd.DataFrame): Has columns ['meter_name', 'r2', 'info'].
+    #     plot_file (str): Output PDF file path.
+    # """
+    # pdf_path = plot_file
+    # meters_ordered = special_meters["meter_name"].tolist()
 
-    skipped_empty = 0
+    # skipped_empty = 0
 
-    with PdfPages(pdf_path) as pdf:
-        for meter in meters_ordered:
-            # Skip if meter not in data
-            if meter not in data.columns:
-                skipped_empty += 1
-                continue
+    # with PdfPages(pdf_path) as pdf:
+    #     for meter in meters_ordered:
+    #         # Skip if meter not in data
+    #         if meter not in data.columns:
+    #             skipped_empty += 1
+    #             continue
 
-            row = special_meters[special_meters["meter_name"] == meter].iloc[0]
-            r2_val, info = row["r2"], row["info"]
+    #         row = special_meters[special_meters["meter_name"] == meter].iloc[0]
+    #         r2_val, info = row["r2"], row["info"]
 
-            # Handle r2 whether it's numeric or string
-            try:
-                r2_float = float(r2_val)
-                if r2_float > 0:
-                    r2_text = f"R² = {r2_float:.4f}"
-                else:
-                    # for 0, -1, -2, -3 we show as integer
-                    r2_text = f"R² = {int(r2_float)}"
-            except (TypeError, ValueError):
-                # fallback if cannot parse as float
-                r2_text = f"R² = {r2_val}"
+    #         # Handle r2 whether it's numeric or string
+    #         try:
+    #             r2_float = float(r2_val)
+    #             if r2_float > 0:
+    #                 r2_text = f"R² = {r2_float:.4f}"
+    #             else:
+    #                 # for 0, -1, -2, -3 we show as integer
+    #                 r2_text = f"R² = {int(r2_float)}"
+    #         except (TypeError, ValueError):
+    #             # fallback if cannot parse as float
+    #             r2_text = f"R² = {r2_val}"
 
-            plt.figure(figsize=(12, 3))
-            plt.plot(data.index, data[meter])
-            plt.xlim(data.index.min(), data.index.max())
-            plt.title(meter)
-            plt.xlabel("Datetime")
-            plt.ylabel("kWh")
-            plt.grid(True)
+    #         plt.figure(figsize=(12, 3))
+    #         plt.plot(data.index, data[meter])
+    #         plt.xlim(data.index.min(), data.index.max())
+    #         plt.title(meter)
+    #         plt.xlabel("Datetime")
+    #         plt.ylabel("kWh")
+    #         plt.grid(True)
 
-            plt.text(
-                0.05, 0.95,
-                f"{r2_text}\n{info}",
-                transform=plt.gca().transAxes,
-                ha="left", va="top",
-                fontsize=9,
-                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
-            )
+    #         plt.text(
+    #             0.05, 0.95,
+    #             f"{r2_text}\n{info}",
+    #             transform=plt.gca().transAxes,
+    #             ha="left", va="top",
+    #             fontsize=9,
+    #             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
+    #         )
 
-            plt.tight_layout()
-            pdf.savefig()
-            plt.close()
+    #         plt.tight_layout()
+    #         pdf.savefig()
+    #         plt.close()
 
-    if skipped_empty > 0:
-        print(f"Skipped plotting for {skipped_empty} meters with no plottable data.")
-    print(f"Special meter plots saved to {pdf_path}")
+    # if skipped_empty > 0:
+    #     print(f"Skipped plotting for {skipped_empty} meters with no plottable data.")
+    # print(f"Special meter plots saved to {pdf_path}")
 
 
 
