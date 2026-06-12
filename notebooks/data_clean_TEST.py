@@ -851,7 +851,7 @@ def _load_base_master_corrections(meter_issues_file):
     return df.reset_index(drop=True)
 
 
-# CHANGED: added simple dedupe key builder for merged master/candidate rows.
+# simple dedupe key builder for merged master/candidate rows.
 def _build_simple_key(df):
     temp = df.copy()
 
