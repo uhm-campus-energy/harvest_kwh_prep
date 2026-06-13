@@ -878,7 +878,7 @@ def _build_simple_key(df):
     )
 
 
-# CHANGED: added master-sheet sync for official corrections, approved candidates, and broken-meter rows.
+# master sheet sync for official corrections, approved candidates, and broken-meter rows.
 def sync_meter_corrections_master_sheet(
     meter_issues_file,
     candidate_file,
