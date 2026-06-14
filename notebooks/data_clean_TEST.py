@@ -1233,7 +1233,6 @@ def update_special_meter_candidates_workbook(
         summary_df["meter_name"] = summary_df["meter_name"].apply(_normalize_text)
         summary_df["issue_type"] = summary_df["info"].apply(summary_info_to_issue_type)
 
-        filtered_special_meter_summary = summary_df[
             ~(
                 summary_df["meter_name"].isin(fully_broken_meters)
                 & summary_df["issue_type"].isin({
