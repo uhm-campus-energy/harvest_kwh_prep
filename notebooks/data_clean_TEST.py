@@ -1226,7 +1226,7 @@ def update_special_meter_candidates_workbook(
 
     summary_rows = pd.DataFrame(columns=candidate_cols)
 
-    filtered_special_meter_summary = pd.DataFrame(columns=["meter_name", "r2", "info"])
+    special_meter_summary_export = pd.DataFrame(columns=["meter_name", "r2", "info"])
 
     if df_bad_meters is not None and not df_bad_meters.empty:
         summary_df = df_bad_meters.copy()
