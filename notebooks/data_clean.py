@@ -152,10 +152,6 @@ def apply_special_meter_corrections(data, special_meters_file):
         print("No special meter file provided. Skipping manual corrections.")
         return data_corrected
 
-    if not os.path.exists(special_meters_file):
-        print(f"Special meter file not found: {special_meters_file}. Skipping manual corrections.")
-        return data_corrected
-
     bad_periods = pd.read_excel(special_meters_file)
 
     required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
@@ -186,7 +182,7 @@ def apply_special_meter_corrections(data, special_meters_file):
 
         if solution == "div100":
             data_corrected.loc[mask, meter] = data_corrected.loc[mask, meter] / 100.0
-        elif solution == "remove":
+        elif solution in {"remove", "broken"}:
             data_corrected.loc[mask, meter] = np.nan
         
 
@@ -354,7 +350,7 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
     Suggest candidate meter issues to help automate the old manual flagging process.
 
     Returns a DataFrame with columns:
-        meter_name, issue_type, start_datetime, end_datetime, details, suggestion
+        meter_name, issue_type, start_datetime, end_datetime, description, suggestion
     """
     suggestions = []
 
@@ -366,7 +362,7 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
                 "issue_type": "all_nan",
                 "start_datetime": pd.NaT,
                 "end_datetime": pd.NaT,
-                "details": "Meter has no valid values in the selected window.",
+                "description": "Meter has no valid values in the selected window.",
                 "suggestion": "review"
             })
             continue
@@ -392,7 +388,7 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
                         "issue_type": "stuck_run",
                         "start_datetime": run_start,
                         "end_datetime": prev_time,
-                        "details": f"Consecutive repeated values for {run_len} points.",
+                        "description": f"Consecutive repeated values for {run_len} points.",
                         "suggestion": "remove_or_no_interp"
                     })
                     added_for_meter += 1
