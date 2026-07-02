@@ -18,6 +18,55 @@ from typing import List, Tuple
 ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
 BROKEN_STATUS_VALUES = {"broken", "repaired", "under_renovation", "no_meter"}
 
+###################################################################
+###################################################################
+
+def _parse_strict_date_series(series, col_name):
+    """
+    Parse date columns safely from CSV without ambiguous guessing. 
+    (Does not alter csv itself)
+
+    Allowed formats:
+    - YYYY-MM-DD
+    - YYYY-MM-DD HH:MM:SS
+    - M/D/YYYY
+    - M/D/YYYY HH:MM:SS
+
+    Blank values become NaT.
+    Any other format raises an error.
+    """
+    allowed_formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y",
+        "%m/%d/%Y %H:%M:%S",
+    ]
+
+    s = series.copy()
+
+    if not isinstance(s, pd.Series):
+        s = pd.Series(s)
+
+    s = s.astype("string").str.strip()
+    s = s.replace({"": pd.NA, "nan": pd.NA, "NaN": pd.NA, "None": pd.NA, "<NA>": pd.NA})
+
+    parsed = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    remaining = s.notna()
+
+    for fmt in allowed_formats:
+        trial = pd.to_datetime(s.where(remaining), format=fmt, errors="coerce")
+        matched = trial.notna()
+        parsed.loc[matched] = trial.loc[matched]
+        remaining = remaining & (~matched)
+
+    if remaining.any():
+        bad_values = sorted(s.loc[remaining].dropna().unique().tolist())
+        raise ValueError(
+            f"Unrecognized date format in column '{col_name}'. "
+            f"Fix these values: {bad_values[:10]}"
+        )
+
+    return parsed
 
 ###################################################################
 ###################################################################
@@ -760,9 +809,9 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
     # df["status"] = df["status"].replace({"no_meter": "under_renovation"})
     df["description"] = df["description"].apply(_normalize_text)
     df["data_source"] = df["data_source"].apply(_normalize_text)
-    df["updated_data"] = pd.to_datetime(df["updated_data"], errors="coerce", dayfirst=dayfirst)
-    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce", dayfirst=dayfirst)
-    df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce", dayfirst=dayfirst)
+    df["updated_data"] = pd.to_datetime(df["updated_data"], errors="coerce", format="mixed", dayfirst=True)
+    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce", format="mixed", dayfirst=True)
+    df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce", format="mixed", dayfirst=True)
 
     df = df[df["meter_name"] != ""].copy()
     df = df[df["status"].isin(BROKEN_STATUS_VALUES)].copy()
@@ -880,7 +929,6 @@ def _build_simple_key(df):
 
 # master sheet sync for official corrections, approved candidates, and broken-meter rows.
 def sync_meter_corrections_master_sheet(
-    meter_issues_file,
     candidate_file,
     broken_meters_file,
     meter_corrections_file,
@@ -888,19 +936,23 @@ def sync_meter_corrections_master_sheet(
     window_end,
 ):
     """
-    Build the master correction workbook by combining:
-    - the official/manual special meter file
+    Build the master corrections file from:
     - approved candidate rows (approved == 1 and solution filled in)
-    - broken-meter rows from the running broken workbook
-
-    For broken-meter rows, the master sheet stores the true start/end dates
-    from the broken-meter source file. Runtime clipping happens later when
-    corrections are applied to a specific data window.
+    - broken meter rows from the running broken meter file
     """
     window_start = pd.to_datetime(window_start)
     window_end = pd.to_datetime(window_end)
 
-    master_df = _load_base_master_corrections(meter_issues_file)
+    master_cols = [
+        "meter_name",
+        "solution",
+        "start_datetime",
+        "end_datetime",
+        "issue_type/status",
+        "description",
+    ]
+    master_df = pd.DataFrame(columns=master_cols)
+
     existing_candidates = _load_existing_candidates(candidate_file)
     broken_df = load_broken_meter_workbook(broken_meters_file)
 
@@ -910,9 +962,9 @@ def sync_meter_corrections_master_sheet(
     ].copy()
 
     if not approved_candidates.empty:
-        approved_candidates = approved_candidates.rename(columns={
-            "issue_type/status": "issue_type/status"
-        })
+        approved_candidates = approved_candidates.rename(
+            columns={"issue_type": "issue_type/status"}
+        )
         approved_candidates = approved_candidates[
             ["meter_name", "solution", "start_datetime", "end_datetime", "issue_type/status", "description"]
         ].copy()
@@ -923,8 +975,6 @@ def sync_meter_corrections_master_sheet(
         true_start = pd.to_datetime(row["start_date"], errors="coerce")
         true_end = pd.to_datetime(row["end_date"], errors="coerce")
 
-        # Only add broken rows that overlap the current analysis window,
-        # but keep the true dates from the broken-meter source in master.
         overlap_start = window_start if pd.isna(true_start) else max(true_start, window_start)
         overlap_end = window_end if pd.isna(true_end) else min(true_end, window_end)
 
@@ -956,22 +1006,11 @@ def sync_meter_corrections_master_sheet(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    export_master = master_df.copy()
-    if "issue_type" in export_master.columns:
-        export_master = export_master.rename(columns={"issue_type": "issue_type/status"})
-
-    master_cols = [
-        "meter_name",
-        "solution",
-        "start_datetime",
-        "end_datetime",
-        "issue_type/status",
-        "description",
-    ]
-    export_master = export_master.reindex(columns=master_cols)
-
-    with pd.ExcelWriter(meter_corrections_file, engine="openpyxl") as writer:
-        export_master.to_excel(writer, sheet_name="master_corrections", index=False)
+    if str(meter_corrections_file).lower().endswith(".csv"):
+        master_df.to_csv(meter_corrections_file, index=False)
+    else:
+        with pd.ExcelWriter(meter_corrections_file, engine="openpyxl") as writer:
+            master_df.to_excel(writer, sheet_name="master_corrections", index=False)
 
     print(f"Master correction workbook saved to {meter_corrections_file}")
     return master_df
