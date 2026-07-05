@@ -867,7 +867,6 @@ def _load_existing_candidates(candidate_file):
     return df.reset_index(drop=True)
 
 
-# CHANGED: added loader for the base/master correction sheet with the simplified column layout.
 def _load_base_master_corrections(meter_issues_file):
     cols = [
         "meter_name", "solution", "start_datetime", "end_datetime",
