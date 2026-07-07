@@ -9,7 +9,6 @@ import matplotlib.cm as cm
 import matplotlib.dates as mdates
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
-from openpyxl import load_workbook
 from typing import List, Tuple
 
 
@@ -23,8 +22,8 @@ BROKEN_STATUS_VALUES = {"broken", "repaired", "under_renovation", "no_meter"}
 
 def _parse_strict_date_series(series, col_name):
     """
-    Parse date columns safely from CSV without ambiguous guessing. 
-    (Does not alter csv itself)
+    Parse date columns safely from csv without guessing. 
+    (Does not alter csv itself).
 
     Allowed formats:
     - YYYY-MM-DD
@@ -67,6 +66,7 @@ def _parse_strict_date_series(series, col_name):
         )
 
     return parsed
+    
 
 ###################################################################
 ###################################################################
@@ -151,13 +151,13 @@ def resolve_analysis_window(index, start_time, end_time):
 def apply_special_meter_corrections(data, special_meters_file):
     # ===== ORIGINAL ZHILING / AURORA CODE (commented out) =====
     #     """
-    #     Apply special corrections to selected meters based on an Excel config file.
+    #     Apply special corrections to selected meters based on a CSV config file.
     #     Correctly handles multiple periods per meter, including overlapping periods.
     #
     #     Returns a copy of the DataFrame.
     #     """
     #     data_corrected = data.copy()
-    #     bad_periods = pd.read_excel(special_meters_file)
+    #     bad_periods = pd.read_csv(special_meters_file)
     #
     #     # Clean up
     #     bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
@@ -185,7 +185,7 @@ def apply_special_meter_corrections(data, special_meters_file):
     #     return data_corrected
 
     """
-    Apply special corrections to selected meters based on an Excel config file.
+    Apply special corrections to selected meters based on a CSV config file.
     Correctly handles multiple periods per meter, including overlapping periods.
 
     Harvest/current behavior:
@@ -208,7 +208,7 @@ def apply_special_meter_corrections(data, special_meters_file):
     if data_corrected.empty or len(data_corrected.index) == 0:
         return data_corrected
 
-    bad_periods = pd.read_excel(special_meters_file)
+    bad_periods = pd.read_csv(special_meters_file)
 
     required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
     missing_cols = required_cols.difference(set(bad_periods.columns))
@@ -272,7 +272,7 @@ def export_removed_special_meter_data(
 
     Args:
         data (pd.DataFrame): Wide meter dataframe with a DatetimeIndex.
-        special_meters_file (str): Excel file with correction rows.
+        special_meters_file (str): CSV file with correction rows.
         output_csv (str or None): Optional CSV output path.
         export_solutions (set/list/tuple or None): Solutions to export.
             Defaults to {"remove", "broken"}.
@@ -314,7 +314,7 @@ def export_removed_special_meter_data(
         print("No special meter file provided. Skipping removed-data export.")
         return pd.DataFrame(columns=export_cols)
 
-    correction_df = pd.read_excel(special_meters_file)
+    correction_df = pd.read_csv(special_meters_file)
 
     required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
     missing_cols = required_cols.difference(set(correction_df.columns))
@@ -669,13 +669,15 @@ def create_special_meters_workbook(
     overwrite=True,
 ):
     """
-    Create an Excel workbook of auto-detected candidate meter issues.
-
-    Notes:
-    - The first sheet uses the same core columns expected by
-      apply_special_meter_corrections: meter_name, solution, start_datetime, end_datetime
+    Create CSV output of auto-detected candidate meter issues, 
+    special_meter_candidates.csv : timeframe candidate rows and prints a 
+    summary of the detected issues.
+    
+    - Uses the same core columns expected by apply_special_meter_corrections: 
+      meter_name, solution, start_datetime, end_datetime
     - solution is intentionally left blank so the workbook is safe for review first
     - extra columns are included to help review the candidates
+
     """
     if output_file is None or str(output_file).strip() == "":
         raise ValueError("output_file must be a non-empty path.")
@@ -685,7 +687,6 @@ def create_special_meters_workbook(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    #TODO: remove possibly?
     if os.path.exists(output_file) and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing file: {output_file}")
 
@@ -727,16 +728,15 @@ def create_special_meters_workbook(
         na_position="last"
     ).reset_index(drop=True)
 
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        issue_df.to_excel(writer, sheet_name="timeframes", index=False)
+    issue_df.to_csv(output_file, index=False)
 
-        if df_bad_meters is not None:
-            df_bad_meters.to_excel(writer, sheet_name="special_meter_summary", index=False)
+    if df_bad_meters is not None:
+        df_bad_meters.to_csv(_sidecar_csv_path(output_file, "_summary"), index=False)
 
-        if df_restarts is not None:
-            df_restarts.to_excel(writer, sheet_name="restarts", index=False)
+    if df_restarts is not None:
+        df_restarts.to_csv(_sidecar_csv_path(output_file, "_restarts"), index=False)
 
-    print(f"Auto-generated special meters workbook saved to {output_file}")
+    print(f"Auto-generated special meters file saved to {output_file}")
     return issue_df
 
 ###################################################################
@@ -765,7 +765,7 @@ def _normalize_text(value, underscore=False):
 # loader for the broken meter workbook with simple normalization and day-first dates.
 def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
     """
-    Load and normalize the running broken meter workbook.
+    Load and normalize the running broken meter CSV.
 
     Expected columns:
         meter_name, start_date, end_date, status, description, data_source, updated_data
@@ -779,14 +779,10 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
         return pd.DataFrame(columns=cols)
 
     if not os.path.exists(broken_meters_file):
-        print(f"Broken meter workbook not found: {broken_meters_file}")
+        print(f"Broken meter file not found: {broken_meters_file}")
         return pd.DataFrame(columns=cols)
 
-    ext = os.path.splitext(str(broken_meters_file))[1].lower()
-    if ext in [".xlsx", ".xls", ".xlsm"]:
-        df = pd.read_excel(broken_meters_file)
-    else:
-        df = pd.read_csv(broken_meters_file)
+    df = pd.read_csv(broken_meters_file)
 
     df = df.copy()
     df.columns = [str(col).strip().lower().replace(" ", "_") for col in df.columns]
@@ -796,7 +792,7 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
     missing_cols = required_cols.difference(set(df.columns))
     if missing_cols:
         raise ValueError(
-            "Broken meter workbook is missing required columns: "
+            "Broken meter file is missing required columns: "
             + ", ".join(sorted(missing_cols))
         )
 
@@ -806,12 +802,11 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
 
     df["meter_name"] = df["meter_name"].apply(_normalize_text)
     df["status"] = df["status"].apply(lambda x: _normalize_text(x, underscore=True))
-    # df["status"] = df["status"].replace({"no_meter": "under_renovation"})
     df["description"] = df["description"].apply(_normalize_text)
     df["data_source"] = df["data_source"].apply(_normalize_text)
-    df["updated_data"] = pd.to_datetime(df["updated_data"], errors="coerce", format="mixed", dayfirst=True)
-    df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce", format="mixed", dayfirst=True)
-    df["end_date"] = pd.to_datetime(df["end_date"], errors="coerce", format="mixed", dayfirst=True)
+    df["updated_data"] = _parse_strict_date_series(df["updated_data"], "updated_data")
+    df["start_date"] = _parse_strict_date_series(df["start_date"], "start_date")
+    df["end_date"] = _parse_strict_date_series(df["end_date"], "end_date")
 
     df = df[df["meter_name"] != ""].copy()
     df = df[df["status"].isin(BROKEN_STATUS_VALUES)].copy()
@@ -837,11 +832,7 @@ def _load_existing_candidates(candidate_file):
     if candidate_file is None or not os.path.exists(candidate_file):
         return pd.DataFrame(columns=cols)
 
-    xls = pd.ExcelFile(candidate_file)
-    sheet_name = "meter_issues" if "meter_issues" in xls.sheet_names else (
-        "timeframes" if "timeframes" in xls.sheet_names else xls.sheet_names[0]
-    )
-    df = pd.read_excel(candidate_file, sheet_name=sheet_name)
+    df = pd.read_csv(candidate_file)
 
     if "issue_type/status" in df.columns and "issue_type" not in df.columns:
         df = df.rename(columns={"issue_type/status": "issue_type"})
@@ -858,8 +849,8 @@ def _load_existing_candidates(candidate_file):
 
     df = df[cols].copy()
     df["meter_name"] = df["meter_name"].apply(_normalize_text)
-    df["start_datetime"] = pd.to_datetime(df["start_datetime"], errors="coerce")
-    df["end_datetime"] = pd.to_datetime(df["end_datetime"], errors="coerce")
+    df["start_datetime"] = _parse_strict_date_series(df["start_datetime"], "start_datetime")
+    df["end_datetime"] = _parse_strict_date_series(df["end_datetime"], "end_datetime")
     df["approved"] = pd.to_numeric(df["approved"], errors="coerce").fillna(0).astype(int)
     df["solution"] = df["solution"].fillna("").astype(str).str.strip().str.lower()
     df["issue_type"] = df["issue_type"].fillna("").astype(str).str.strip().str.lower()
@@ -867,36 +858,42 @@ def _load_existing_candidates(candidate_file):
     return df.reset_index(drop=True)
 
 
-def _load_base_master_corrections(meter_issues_file):
-    cols = [
-        "meter_name", "solution", "start_datetime", "end_datetime",
-        "issue_type/status", "description"
-    ]
-    if meter_issues_file is None or not os.path.exists(meter_issues_file):
-        return pd.DataFrame(columns=cols)
+# TODO: consider re-adding this loader for the official meter issues file if needed in the future.
+# used to load "offical" meter issues file (meter_issues_file var) for the master corrections workflow
+# (for meter_issues_file + candidate_file + broken_meters_file)
+# def _load_base_master_corrections(meter_issues_file):
+#     '''
+#     Load the base master corrections file from the official meter issues csv.
+#     '''
+#     cols = [
+#         "meter_name", "solution", "start_datetime", "end_datetime",
+#         "issue_type/status", "description"
+#     ]
+#     if meter_issues_file is None or not os.path.exists(meter_issues_file):
+#         return pd.DataFrame(columns=cols)
 
-    df = pd.read_excel(meter_issues_file)
+#     df = pd.read_csv(meter_issues_file)
 
-    if "issue_type" in df.columns and "issue_type/status" not in df.columns:
-        df = df.rename(columns={"issue_type": "issue_type/status"})
-    if "status" in df.columns and "issue_type/status" not in df.columns:
-        df = df.rename(columns={"status": "issue_type/status"})
-    if "details" in df.columns and "description" not in df.columns:
-        df = df.rename(columns={"details": "description"})
+#     if "issue_type" in df.columns and "issue_type/status" not in df.columns:
+#         df = df.rename(columns={"issue_type": "issue_type/status"})
+#     if "status" in df.columns and "issue_type/status" not in df.columns:
+#         df = df.rename(columns={"status": "issue_type/status"})
+#     if "details" in df.columns and "description" not in df.columns:
+#         df = df.rename(columns={"details": "description"})
 
-    for col in cols:
-        if col not in df.columns:
-            df[col] = "" if col in {"meter_name", "solution", "issue_type/status", "description"} else pd.NaT
+#     for col in cols:
+#         if col not in df.columns:
+#             df[col] = "" if col in {"meter_name", "solution", "issue_type/status", "description"} else pd.NaT
 
-    df = df[cols].copy()
-    df["meter_name"] = df["meter_name"].apply(_normalize_text)
-    df["solution"] = df["solution"].fillna("").astype(str).str.strip().str.lower()
-    df["start_datetime"] = pd.to_datetime(df["start_datetime"], errors="coerce")
-    df["end_datetime"] = pd.to_datetime(df["end_datetime"], errors="coerce")
-    df["issue_type/status"] = df["issue_type/status"].fillna("").astype(str).str.strip()
-    df["description"] = df["description"].fillna("").astype(str).str.strip()
+#     df = df[cols].copy()
+#     df["meter_name"] = df["meter_name"].apply(_normalize_text)
+#     df["solution"] = df["solution"].fillna("").astype(str).str.strip().str.lower()
+#     df["start_datetime"] = _parse_strict_date_series(df["start_datetime"], "start_datetime")
+#     df["end_datetime"] = _parse_strict_date_series(df["end_datetime"], "end_datetime")
+#     df["issue_type/status"] = df["issue_type/status"].fillna("").astype(str).str.strip()
+#     df["description"] = df["description"].fillna("").astype(str).str.strip()
 
-    return df.reset_index(drop=True)
+#     return df.reset_index(drop=True)
 
 
 # simple dedupe key builder for merged master/candidate rows.
@@ -1005,13 +1002,9 @@ def sync_meter_corrections_master_sheet(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    if str(meter_corrections_file).lower().endswith(".csv"):
-        master_df.to_csv(meter_corrections_file, index=False)
-    else:
-        with pd.ExcelWriter(meter_corrections_file, engine="openpyxl") as writer:
-            master_df.to_excel(writer, sheet_name="master_corrections", index=False)
+    master_df.to_csv(meter_corrections_file, index=False)
 
-    print(f"Master correction workbook saved to {meter_corrections_file}")
+    print(f"Master correction file saved to {meter_corrections_file}")
     return master_df
 
 
@@ -1352,14 +1345,21 @@ def update_special_meter_candidates_workbook(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    with pd.ExcelWriter(candidate_file, engine="openpyxl") as writer:
-        combined_candidates.to_excel(writer, sheet_name="timeframes", index=False)
-        if df_bad_meters is not None:
-            special_meter_summary_export.to_excel(writer, sheet_name="special_meter_summary", index=False)
-        if df_restarts is not None:
-            df_restarts.to_excel(writer, sheet_name="restarts", index=False)
+    combined_candidates.to_csv(candidate_file, index=False)
 
-    print(f"Candidate review workbook saved to {candidate_file}")
+    restart_output_file = os.path.splitext(candidate_file)[0] + "_restarts.csv"
+    if df_restarts is not None and not df_restarts.empty:
+        df_restarts.to_csv(restart_output_file, index=False)
+        print(f"Restart file saved to {restart_output_file}")
+    elif os.path.exists(restart_output_file):
+        os.remove(restart_output_file)
+
+    print(f"Candidate review file saved to {candidate_file}")
+
+    if df_bad_meters is not None and not special_meter_summary_export.empty:
+        print("\nSpecial meter summary:")
+        print(special_meter_summary_export.to_string(index=False))
+
     return combined_candidates
 
 
@@ -2186,7 +2186,7 @@ def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=N
     #
     #     # STEP 0: Apply 'no_interp' periods from special_meters_file
     #     if special_meters_file is not None:
-    #         bad_periods = pd.read_excel(special_meters_file)
+    #         bad_periods = pd.read_csv(special_meters_file)
     #         bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
     #         bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
     #         bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
@@ -2237,7 +2237,7 @@ def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=N
         and str(special_meters_file).strip() != ""
         and os.path.exists(special_meters_file)
     ):
-        bad_periods = pd.read_excel(special_meters_file)
+        bad_periods = pd.read_csv(special_meters_file)
         required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
         if required_cols.issubset(set(bad_periods.columns)):
             bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
