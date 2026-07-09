@@ -634,15 +634,13 @@ def create_special_meters_workbook(
     overwrite=True,
 ):
     """
-    Create CSV output of auto-detected candidate meter issues, 
-    special_meter_candidates.csv : timeframe candidate rows and prints a 
-    summary of the detected issues.
-    
-    - Uses the same core columns expected by apply_special_meter_corrections: 
-      meter_name, solution, start_datetime, end_datetime
-    - solution is intentionally left blank so the workbook is safe for review first
-    - extra columns are included to help review the candidates
+    Create a CSV file of auto-detected candidate meter issues.
 
+    Saves:
+    - special_meter_candidates.csv with timeframe candidate rows
+
+    Prints:
+    - detected special meter summary
     """
     if output_file is None or str(output_file).strip() == "":
         raise ValueError("output_file must be a non-empty path.")
@@ -695,13 +693,16 @@ def create_special_meters_workbook(
 
     issue_df.to_csv(output_file, index=False)
 
-    if df_bad_meters is not None:
-        df_bad_meters.to_csv(_sidecar_csv_path(output_file, "_summary"), index=False)
-
-    if df_restarts is not None:
-        df_restarts.to_csv(_sidecar_csv_path(output_file, "_restarts"), index=False)
-
     print(f"Auto-generated special meters file saved to {output_file}")
+
+    if df_bad_meters is not None and not df_bad_meters.empty:
+        print("\nDetected special meter summary:")
+        print(df_bad_meters.to_string(index=False))
+
+    # if df_restarts is not None and not df_restarts.empty:
+    #     print("\nDetected restart summary:")
+    #     print(df_restarts.to_string(index=False))
+
     return issue_df
 
 ###################################################################
@@ -1435,8 +1436,38 @@ def plot_review_meters_with_overlays(
 
             meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
             for _, row in meter_candidates.iterrows():
-                if pd.notna(row["start_datetime"]) and pd.notna(row["end_datetime"]):
-                    plt.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="blue")
+                issue_type = str(row["issue_type"]).strip().lower()
+                start_dt = pd.to_datetime(row["start_datetime"], errors="coerce")
+                end_dt = pd.to_datetime(row["end_datetime"], errors="coerce")
+
+                # For "restart_or_drop" issues, draw a vertical dashed line at the end datetime if it exists.
+                if issue_type == "restart_or_drop":
+                    if pd.notna(end_dt):
+                        # TODO: ask eileen and decide best
+                        # Plot green 'x' marker at the end datetime if the value exists in the data
+                        y_val = data[meter].asof(end_dt)
+                        if pd.notna(y_val):
+                            plt.scatter(
+                                [end_dt],
+                                [y_val],
+                                marker="x",
+                                color="green",
+                                s=45,
+                                linewidths=1.5,
+                                zorder=5,
+                            )
+                        # Black dashed line:
+                        # plt.axvline(
+                        #     end_dt,
+                        #     color="black",
+                        #     linestyle="--",
+                        #     linewidth=1.2,
+                        #     alpha=0.9,
+                        # )
+                else:
+                    # For other issue types, draw a blue shaded region if both start and end datetimes are valid.
+                    if pd.notna(start_dt) and pd.notna(end_dt):
+                        plt.axvspan(start_dt, end_dt, alpha=0.2, color="blue")
 
             issue_types = [
                 str(value).strip()
