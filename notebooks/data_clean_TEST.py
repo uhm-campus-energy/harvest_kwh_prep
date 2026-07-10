@@ -349,6 +349,9 @@ def export_removed_special_meter_data(
 
         export_piece = meter_series.rename("meter_reading").reset_index()
         export_piece.columns = ["datetime", "meter_reading"]
+        export_piece = export_piece.dropna(subset=["meter_reading"])
+        if export_piece.empty:
+            continue
         export_piece["meter_name"] = meter
         export_piece["solution"] = row["solution"]
         export_piece["correction_start"] = row["start_datetime"]
@@ -623,87 +626,6 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
     ).reset_index(drop=True)
 
 
-###################################################################
-###################################################################
-
-def create_special_meters_workbook(
-    data,
-    output_file,
-    df_bad_meters=None,
-    df_restarts=None,
-    overwrite=True,
-):
-    """
-    Create a CSV file of auto-detected candidate meter issues.
-
-    Saves:
-    - special_meter_candidates.csv with timeframe candidate rows
-
-    Prints:
-    - detected special meter summary
-    """
-    if output_file is None or str(output_file).strip() == "":
-        raise ValueError("output_file must be a non-empty path.")
-
-    output_file = str(output_file)
-    output_dir = os.path.dirname(output_file)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    if os.path.exists(output_file) and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing file: {output_file}")
-
-    issue_df = suggest_meter_issues(data)
-
-    if issue_df.empty:
-        issue_df = pd.DataFrame(columns=[
-            "meter_name", "issue_type", "start_datetime", "end_datetime", "description", "suggestion"
-        ])
-
-    issue_df = issue_df.copy()
-    issue_df["solution"] = ""
-
-    if df_bad_meters is not None and not df_bad_meters.empty:
-        meta = df_bad_meters.rename(columns={"r2": "detected_r2", "info": "detected_info"})
-        meta = meta[["meter_name", "detected_r2", "detected_info"]]
-        issue_df = issue_df.merge(meta, on="meter_name", how="left")
-    else:
-        issue_df["detected_r2"] = np.nan
-        issue_df["detected_info"] = ""
-
-    ordered_cols = [
-        "meter_name",
-        "solution",
-        "start_datetime",
-        "end_datetime",
-        "issue_type",
-        "description",
-        "suggestion",
-        "detected_r2",
-        "detected_info",
-    ]
-    for col in ordered_cols:
-        if col not in issue_df.columns:
-            issue_df[col] = np.nan
-
-    issue_df = issue_df[ordered_cols].sort_values(
-        by=["meter_name", "start_datetime", "issue_type"],
-        na_position="last"
-    ).reset_index(drop=True)
-
-    issue_df.to_csv(output_file, index=False)
-
-    print(f"Auto-generated special meters file saved to {output_file}")
-
-    if df_bad_meters is not None and not df_bad_meters.empty:
-        print("\nDetected special meter summary:")
-        print(df_bad_meters.to_string(index=False))
-
-    # if df_restarts is not None and not df_restarts.empty:
-    #     print("\nDetected restart summary:")
-    #     print(df_restarts.to_string(index=False))
-
-    return issue_df
 
 ###################################################################
 ###################################################################
@@ -781,7 +703,7 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
 
 
 
-# CHANGED: added loader for the candidate workbook used by the review workflow.
+# loader for the candidate workbook used by the review workflow.
 def _load_existing_candidates(candidate_file):
     cols = [
         "meter_name",
