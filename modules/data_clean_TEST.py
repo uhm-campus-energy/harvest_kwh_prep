@@ -602,7 +602,7 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
 
         diffs = series.diff()
 
-        # Restarts / drops
+        # restarts / drops
         neg_diffs = diffs[diffs < 0]
         for t, diff_val in neg_diffs.head(max_rows_per_meter).items():
             prev_idx = series.index[series.index.get_loc(t) - 1] if series.index.get_loc(t) > 0 else pd.NaT
@@ -1365,27 +1365,14 @@ def plot_review_meters_with_overlays(
                 # For "restart_or_drop" issues, draw a vertical dashed line at the end datetime if it exists.
                 if issue_type == "restart_or_drop":
                     if pd.notna(end_dt):
-                        # TODO: ask eileen and decide best
-                        # Plot green 'x' marker at the end datetime if the value exists in the data
-                        y_val = data[meter].asof(end_dt)
-                        if pd.notna(y_val):
-                            plt.scatter(
-                                [end_dt],
-                                [y_val],
-                                marker="x",
-                                color="green",
-                                s=45,
-                                linewidths=1.5,
-                                zorder=5,
-                            )
                         # Black dashed line:
-                        # plt.axvline(
-                        #     end_dt,
-                        #     color="black",
-                        #     linestyle="--",
-                        #     linewidth=1.2,
-                        #     alpha=0.9,
-                        # )
+                        plt.axvline(
+                            end_dt,
+                            color="black",
+                            linestyle="--",
+                            linewidth=1.2,
+                            alpha=0.9,
+                        )
                 else:
                     # For other issue types, draw a blue shaded region if both start and end datetimes are valid.
                     if pd.notna(start_dt) and pd.notna(end_dt):
