@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python \"C:\\\\Users\\\\EILEEN~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-EileenPeppard-Documents-GitHub-harvest-kwh-prep\\\\fcc10ea9-c8ae-462e-85a0-aa19cb24542e\\\\scratchpad\\\\compare_meters.py\")",
+      "PowerShell(python3 \"C:\\\\Users\\\\EILEEN~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-EileenPeppard-Documents-GitHub-harvest-kwh-prep\\\\fcc10ea9-c8ae-462e-85a0-aa19cb24542e\\\\scratchpad\\\\compare_meters.py\")",
+      "PowerShell(Get-Command conda -ErrorAction SilentlyContinue; where.exe python 2>$null; Get-ChildItem \"$env:LOCALAPPDATA\\\\Programs\\\\Python\" -ErrorAction SilentlyContinue; Get-ChildItem \"$env:USERPROFILE\\\\miniconda3\",\"$env:USERPROFILE\\\\anaconda3\" -ErrorAction SilentlyContinue)",
+      "PowerShell(& \"C:\\\\Users\\\\EileenPeppard\\\\anaconda3\\\\python.exe\" \"C:\\\\Users\\\\EILEEN~1\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-EileenPeppard-Documents-GitHub-harvest-kwh-prep\\\\fcc10ea9-c8ae-462e-85a0-aa19cb24542e\\\\scratchpad\\\\compare_meters.py\")"
+    ]
+  }
+}
