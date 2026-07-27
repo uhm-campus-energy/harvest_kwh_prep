@@ -11,6 +11,8 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 from typing import List, Tuple
 
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 
 # 'broken' is treated like a removal style correction
@@ -1251,9 +1253,145 @@ def update_special_meter_candidates_workbook(
     return combined_candidates
 
 
-def plot_all_meters_to_pdf(data, plot_file, ylabel="meter_reading"):
+###################################################################
+###################################################################
+
+
+def _get_review_plot_legend_handles():
     """
-    Plot every meter in the current dataframe to one PDF without reloading the CSV.
+    Return one consistent set of legend entries for review meter PDF pages.
+
+    Proxy artists are used so repeated intervals do not create duplicate
+    legend entries.
+    """
+    return [
+        Line2D(
+            [0],
+            [0],
+            color="#1f77b4",
+            linewidth=1.4,
+            label="Raw meter reading",
+        ),
+        Patch(
+            facecolor="red",
+            edgecolor="red",
+            alpha=0.20,
+            label="Broken meter interval",
+        ),
+        Patch(
+            facecolor="blue",
+            edgecolor="blue",
+            alpha=0.20,
+            label="Candidate issue interval",
+        ),
+        Line2D(
+            [0],
+            [0],
+            color="black",
+            linestyle="--",
+            linewidth=1.2,
+            label="Restart / drop event",
+        ),
+    ]
+
+
+def _add_pdf_legend_page(
+    pdf,
+    title,
+    handles,
+    description="",
+    notes=None,
+):
+    """
+    Add a standalone legend page as the first page of a multipage PDF.
+
+    Parameters
+    ----------
+    pdf : PdfPages
+        Open PdfPages object.
+    title : str
+        Main title displayed at the top of the page.
+    handles : list
+        Matplotlib Line2D/Patch objects used for the legend.
+    description : str
+        Short explanation displayed below the title.
+    notes : list[str] or None
+        Additional explanatory notes displayed below the legend.
+    """
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    ax.axis("off")
+
+    fig.suptitle(
+        title,
+        fontsize=20,
+        fontweight="bold",
+        y=0.91,
+    )
+
+    if description:
+        fig.text(
+            0.50,
+            0.82,
+            description,
+            ha="center",
+            va="top",
+            fontsize=11,
+            wrap=True,
+        )
+
+    legend = ax.legend(
+        handles=handles,
+        loc="center",
+        bbox_to_anchor=(0.50, 0.55),
+        title="Plot key",
+        fontsize=12,
+        title_fontsize=14,
+        frameon=True,
+        borderpad=1.2,
+        labelspacing=1.2,
+        handlelength=3,
+    )
+
+    if notes:
+        note_text = "\n".join(f"• {note}" for note in notes)
+
+        fig.text(
+            0.50,
+            0.23,
+            note_text,
+            ha="center",
+            va="top",
+            fontsize=10,
+            linespacing=1.5,
+        )
+
+    fig.text(
+        0.50,
+        0.08,
+        "This key applies to every graph on the following pages.",
+        ha="center",
+        va="center",
+        fontsize=10,
+        style="italic",
+        color="0.35",
+    )
+
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def plot_all_meters_to_pdf(
+    data,
+    plot_file,
+    ylabel="meter_reading",
+    line_label="Corrected meter reading",
+):
+    """
+    Plot every meter in the current dataframe to one PDF.
+
+    This function is currently called with data_corrected in
+    1.kwh_end_points.ipynb, so each page identifies the line as
+    corrected meter data.
     """
     if data is None or data.empty:
         print("No data available for all-meter plotting.")
@@ -1263,27 +1401,97 @@ def plot_all_meters_to_pdf(data, plot_file, ylabel="meter_reading"):
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    data = data.copy()
+    data.index = pd.to_datetime(data.index, errors="coerce")
+    data = data.sort_index()
+
     data_start = pd.to_datetime(data.index.min())
     data_end = pd.to_datetime(data.index.max())
 
     with PdfPages(plot_file) as pdf:
+        all_meter_legend_handles = [
+            Line2D(
+                [0],
+                [0],
+                color="#1f77b4",
+                linewidth=1.4,
+                label=line_label,
+            ),
+        ]
+
+        # Page 1: standalone plot key
+        _add_pdf_legend_page(
+            pdf=pdf,
+            title="All Corrected Meter Plots",
+            handles=all_meter_legend_handles,
+            description=(
+                "These plots show meter readings after approved special meter "
+                "corrections have been applied."
+            ),
+            notes=[
+                "Each following page contains one meter.",
+                "Gaps may represent original missing readings.",
+                "Gaps may also represent approved remove or broken meter intervals.",
+            ],
+        )
+
+        # Pages 2 onward: meter plots
         for meter_name in data.columns:
-            fig, ax = plt.subplots(figsize=(12, 3))
-            ax.plot(data.index, data[meter_name], linewidth=1.2)
+            # Extra width leaves room for the legend and explanatory note.
+            fig, ax = plt.subplots(figsize=(14, 3.5))
+
+            ax.plot(
+                data.index,
+                data[meter_name],
+                color="0.20",
+                linewidth=1.2,
+                label=line_label,
+            )
+
             ax.set_xlim(data_start, data_end)
-            ax.set_title(meter_name)
+            ax.set_title(f"{meter_name}")
             ax.set_xlabel("Datetime")
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
 
+            fig.tight_layout()
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
     print(f"All-meter plots saved to {plot_file}")
+# def plot_all_meters_to_pdf(data, plot_file, ylabel="meter_reading"):
+#     """
+#     Plot every meter in the current dataframe to one PDF without reloading the CSV.
+#     """
+#     if data is None or data.empty:
+#         print("No data available for all-meter plotting.")
+#         return
+
+#     output_dir = os.path.dirname(str(plot_file))
+#     if output_dir:
+#         os.makedirs(output_dir, exist_ok=True)
+
+#     data_start = pd.to_datetime(data.index.min())
+#     data_end = pd.to_datetime(data.index.max())
+
+#     with PdfPages(plot_file) as pdf:
+#         for meter_name in data.columns:
+#             fig, ax = plt.subplots(figsize=(12, 3))
+#             ax.plot(data.index, data[meter_name], linewidth=1.2)
+#             ax.set_xlim(data_start, data_end)
+#             ax.set_title(meter_name)
+#             ax.set_xlabel("Datetime")
+#             ax.set_ylabel(ylabel)
+#             ax.grid(True, alpha=0.3)
+
+#             pdf.savefig(fig, bbox_inches="tight")
+#             plt.close(fig)
+
+#     print(f"All-meter plots saved to {plot_file}")
 
 
 
-# review plotting with red broken-meter overlays and blue candidate overlays.
+# review plotting with red broken meter overlays and blue candidate overlays.
 def plot_review_meters_with_overlays(
     data,
     candidate_file,
@@ -1343,18 +1551,49 @@ def plot_review_meters_with_overlays(
             return f"R² = {r2_val}"
 
     with PdfPages(plot_file) as pdf:
+        # Page 1: standalone plot key
+        _add_pdf_legend_page(
+            pdf=pdf,
+            title="Review Meter Plots",
+            handles=_get_review_plot_legend_handles(),
+            description=(
+                "These plots show raw meter readings together with broken meter "
+                "intervals and unresolved candidate issues."
+            ),
+            notes=[
+                "Red and blue shaded intervals may overlap and appear purple.",
+                "A black dashed line marks the detected restart or drop timestamp.",
+                "Issue_type and R² information may appear inside individual plots.",
+            ],
+        )
+
+            # Pages 2 onward: meter plots
         for meter in review_meters:
-            plt.figure(figsize=(12, 3))
-            plt.plot(data.index, data[meter], linewidth=1.2)
-            plt.xlim(data_start, data_end)
-            plt.title(meter)
-            plt.xlabel("Datetime")
-            plt.ylabel(ylabel)
-            plt.grid(True, alpha=0.3)
+            fig, ax = plt.subplots(figsize=(14, 3.5))
+
+            ax.plot(
+                data.index,
+                data[meter],
+                color="#1f77b4",
+                linewidth=1.2,
+            )
+
+            ax.set_xlim(data_start, data_end)
+            ax.set_title(f"{meter}")
+            ax.set_xlabel("Datetime")
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.3)
 
             meter_broken = broken_df[broken_df["meter_name"] == meter]
+
             for _, row in meter_broken.iterrows():
-                plt.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
+                    ax.axvspan(
+                        row["start_datetime"],
+                        row["end_datetime"],
+                        facecolor="red",
+                        edgecolor="red",
+                        alpha=0.20,
+                    )
 
             meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
             for _, row in meter_candidates.iterrows():
@@ -1366,7 +1605,7 @@ def plot_review_meters_with_overlays(
                 if issue_type == "restart_or_drop":
                     if pd.notna(end_dt):
                         # Black dashed line:
-                        plt.axvline(
+                        ax.axvline(
                             end_dt,
                             color="black",
                             linestyle="--",
@@ -1376,7 +1615,13 @@ def plot_review_meters_with_overlays(
                 else:
                     # For other issue types, draw a blue shaded region if both start and end datetimes are valid.
                     if pd.notna(start_dt) and pd.notna(end_dt):
-                        plt.axvspan(start_dt, end_dt, alpha=0.2, color="blue")
+                        ax.axvspan(
+                            start_dt,
+                            end_dt,
+                            facecolor="blue",
+                            edgecolor="blue",
+                            alpha=0.20,
+                        )
 
             issue_types = [
                 str(value).strip()
@@ -1396,20 +1641,153 @@ def plot_review_meters_with_overlays(
                 annotation_lines.append(", ".join(r2_values))
 
             if annotation_lines:
-                plt.text(
-                    0.05, 0.95,
+                ax.text(
+                    0.02,
+                    0.97,
                     "\n".join(annotation_lines),
-                    transform=plt.gca().transAxes,
-                    ha="left", va="top",
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
                     fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
+                    bbox=dict(
+                        boxstyle="round,pad=0.3",
+                        facecolor="white",
+                        edgecolor="gray",
+                        alpha=0.80,
+                    ),
                 )
 
-            plt.tight_layout()
-            pdf.savefig()
-            plt.close()
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
 
     print(f"Review overlay plots saved to {plot_file}")
+# def plot_review_meters_with_overlays(
+#     data,
+#     candidate_file,
+#     broken_meters_file,
+#     plot_file,
+#     ylabel="kWh",
+#     ):
+    
+#     if data is None or data.empty:
+#         raise ValueError("data is empty.")
+
+#     data = data.copy()
+#     data.index = pd.to_datetime(data.index, errors="coerce")
+#     data = data.sort_index()
+
+#     data_start = pd.to_datetime(data.index.min())
+#     data_end = pd.to_datetime(data.index.max())
+
+#     candidate_df = _load_existing_candidates(candidate_file).copy()
+
+#     broken_source_df = load_broken_meter_workbook(broken_meters_file)
+#     broken_plot_rows = []
+#     for _, row in broken_source_df.iterrows():
+#         start = data_start if pd.isna(row["start_date"]) else max(pd.to_datetime(row["start_date"]), data_start)
+#         end = data_end if pd.isna(row["end_date"]) else min(pd.to_datetime(row["end_date"]), data_end)
+#         if start <= end:
+#             broken_plot_rows.append({
+#                 "meter_name": row["meter_name"],
+#                 "start_datetime": start,
+#                 "end_datetime": end,
+#             })
+
+#     broken_df = pd.DataFrame(broken_plot_rows, columns=["meter_name", "start_datetime", "end_datetime"])
+
+#     review_meters = sorted(
+#         (set(candidate_df["meter_name"]) | set(broken_df["meter_name"]))
+#         & set(data.columns)
+#     )
+
+#     if not review_meters:
+#         print("No review meters found in data.")
+#         return
+
+#     output_dir = os.path.dirname(str(plot_file))
+#     if output_dir:
+#         os.makedirs(output_dir, exist_ok=True)
+
+#     def format_r2_value(r2_val):
+#         if pd.isna(r2_val):
+#             return ""
+#         try:
+#             r2_float = float(r2_val)
+#             if r2_float > 0:
+#                 return f"R² = {r2_float:.4f}"
+#             return f"R² = {int(r2_float)}"
+#         except (TypeError, ValueError):
+#             return f"R² = {r2_val}"
+
+#     with PdfPages(plot_file) as pdf:
+#         for meter in review_meters:
+#             plt.figure(figsize=(12, 3))
+#             plt.plot(data.index, data[meter], linewidth=1.2)
+#             plt.xlim(data_start, data_end)
+#             plt.title(meter)
+#             plt.xlabel("Datetime")
+#             plt.ylabel(ylabel)
+#             plt.grid(True, alpha=0.3)
+
+#             meter_broken = broken_df[broken_df["meter_name"] == meter]
+#             for _, row in meter_broken.iterrows():
+#                 plt.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
+
+#             meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
+#             for _, row in meter_candidates.iterrows():
+#                 issue_type = str(row["issue_type"]).strip().lower()
+#                 start_dt = pd.to_datetime(row["start_datetime"], errors="coerce")
+#                 end_dt = pd.to_datetime(row["end_datetime"], errors="coerce")
+
+#                 # For "restart_or_drop" issues, draw a vertical dashed line at the end datetime if it exists.
+#                 if issue_type == "restart_or_drop":
+#                     if pd.notna(end_dt):
+#                         # Black dashed line:
+#                         plt.axvline(
+#                             end_dt,
+#                             color="black",
+#                             linestyle="--",
+#                             linewidth=1.2,
+#                             alpha=0.9,
+#                         )
+#                 else:
+#                     # For other issue types, draw a blue shaded region if both start and end datetimes are valid.
+#                     if pd.notna(start_dt) and pd.notna(end_dt):
+#                         plt.axvspan(start_dt, end_dt, alpha=0.2, color="blue")
+
+#             issue_types = [
+#                 str(value).strip()
+#                 for value in pd.unique(meter_candidates["issue_type"].dropna())
+#                 if str(value).strip() != ""
+#             ]
+#             r2_values = [
+#                 format_r2_value(value)
+#                 for value in pd.unique(meter_candidates["r2"].dropna())
+#                 if format_r2_value(value) != ""
+#             ]
+
+#             annotation_lines = []
+#             if issue_types:
+#                 annotation_lines.append("Issue type: " + ", ".join(issue_types))
+#             if r2_values:
+#                 annotation_lines.append(", ".join(r2_values))
+
+#             if annotation_lines:
+#                 plt.text(
+#                     0.05, 0.95,
+#                     "\n".join(annotation_lines),
+#                     transform=plt.gca().transAxes,
+#                     ha="left", va="top",
+#                     fontsize=9,
+#                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
+#                 )
+
+#             plt.tight_layout()
+#             pdf.savefig()
+#             plt.close()
+
+#     print(f"Review overlay plots saved to {plot_file}")
 
 
 
