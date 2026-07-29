@@ -1385,6 +1385,7 @@ def plot_all_meters_to_pdf(
     plot_file,
     ylabel="meter_reading",
     line_label="Corrected meter reading",
+    meter_type_map=None,
 ):
     """
     Plot every meter in the current dataframe to one PDF.
@@ -1449,7 +1450,18 @@ def plot_all_meters_to_pdf(
             )
 
             ax.set_xlim(data_start, data_end)
-            ax.set_title(f"{meter_name}")
+
+            # label meter '[main]' or '[sub]' on plot
+            meter_type = ""
+            if meter_type_map is not None:
+                meter_type = str(meter_type_map.get(meter_name, "")).strip()
+
+            meter_title = (
+                f"{meter_name} [{meter_type}]"
+                if meter_type
+                else str(meter_name)
+            )
+            ax.set_title(meter_title)
             ax.set_xlabel("Datetime")
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
@@ -1459,35 +1471,6 @@ def plot_all_meters_to_pdf(
             plt.close(fig)
 
     print(f"All-meter plots saved to {plot_file}")
-# def plot_all_meters_to_pdf(data, plot_file, ylabel="meter_reading"):
-#     """
-#     Plot every meter in the current dataframe to one PDF without reloading the CSV.
-#     """
-#     if data is None or data.empty:
-#         print("No data available for all-meter plotting.")
-#         return
-
-#     output_dir = os.path.dirname(str(plot_file))
-#     if output_dir:
-#         os.makedirs(output_dir, exist_ok=True)
-
-#     data_start = pd.to_datetime(data.index.min())
-#     data_end = pd.to_datetime(data.index.max())
-
-#     with PdfPages(plot_file) as pdf:
-#         for meter_name in data.columns:
-#             fig, ax = plt.subplots(figsize=(12, 3))
-#             ax.plot(data.index, data[meter_name], linewidth=1.2)
-#             ax.set_xlim(data_start, data_end)
-#             ax.set_title(meter_name)
-#             ax.set_xlabel("Datetime")
-#             ax.set_ylabel(ylabel)
-#             ax.grid(True, alpha=0.3)
-
-#             pdf.savefig(fig, bbox_inches="tight")
-#             plt.close(fig)
-
-#     print(f"All-meter plots saved to {plot_file}")
 
 
 
@@ -1498,6 +1481,7 @@ def plot_review_meters_with_overlays(
     broken_meters_file,
     plot_file,
     ylabel="kWh",
+    meter_type_map=None,
     ):
     
     if data is None or data.empty:
@@ -1579,7 +1563,18 @@ def plot_review_meters_with_overlays(
             )
 
             ax.set_xlim(data_start, data_end)
-            ax.set_title(f"{meter}")
+
+            # label meter '[main]' or '[sub]' on plot
+            meter_type = ""
+            if meter_type_map is not None:
+                meter_type = str(meter_type_map.get(meter, "")).strip()
+
+            meter_title = (
+                f"{meter} [{meter_type}]"
+                if meter_type
+                else str(meter)
+            )
+            ax.set_title(meter_title)
             ax.set_xlabel("Datetime")
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.3)
