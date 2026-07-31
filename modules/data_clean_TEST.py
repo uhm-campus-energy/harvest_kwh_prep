@@ -1444,7 +1444,7 @@ def plot_all_meters_to_pdf(
             ax.plot(
                 data.index,
                 data[meter_name],
-                color="0.20",
+                color="#1f77b4",
                 linewidth=1.2,
                 label=line_label,
             )
@@ -1657,132 +1657,6 @@ def plot_review_meters_with_overlays(
             plt.close(fig)
 
     print(f"Review overlay plots saved to {plot_file}")
-# def plot_review_meters_with_overlays(
-#     data,
-#     candidate_file,
-#     broken_meters_file,
-#     plot_file,
-#     ylabel="kWh",
-#     ):
-    
-#     if data is None or data.empty:
-#         raise ValueError("data is empty.")
-
-#     data = data.copy()
-#     data.index = pd.to_datetime(data.index, errors="coerce")
-#     data = data.sort_index()
-
-#     data_start = pd.to_datetime(data.index.min())
-#     data_end = pd.to_datetime(data.index.max())
-
-#     candidate_df = _load_existing_candidates(candidate_file).copy()
-
-#     broken_source_df = load_broken_meter_workbook(broken_meters_file)
-#     broken_plot_rows = []
-#     for _, row in broken_source_df.iterrows():
-#         start = data_start if pd.isna(row["start_date"]) else max(pd.to_datetime(row["start_date"]), data_start)
-#         end = data_end if pd.isna(row["end_date"]) else min(pd.to_datetime(row["end_date"]), data_end)
-#         if start <= end:
-#             broken_plot_rows.append({
-#                 "meter_name": row["meter_name"],
-#                 "start_datetime": start,
-#                 "end_datetime": end,
-#             })
-
-#     broken_df = pd.DataFrame(broken_plot_rows, columns=["meter_name", "start_datetime", "end_datetime"])
-
-#     review_meters = sorted(
-#         (set(candidate_df["meter_name"]) | set(broken_df["meter_name"]))
-#         & set(data.columns)
-#     )
-
-#     if not review_meters:
-#         print("No review meters found in data.")
-#         return
-
-#     output_dir = os.path.dirname(str(plot_file))
-#     if output_dir:
-#         os.makedirs(output_dir, exist_ok=True)
-
-#     def format_r2_value(r2_val):
-#         if pd.isna(r2_val):
-#             return ""
-#         try:
-#             r2_float = float(r2_val)
-#             if r2_float > 0:
-#                 return f"R² = {r2_float:.4f}"
-#             return f"R² = {int(r2_float)}"
-#         except (TypeError, ValueError):
-#             return f"R² = {r2_val}"
-
-#     with PdfPages(plot_file) as pdf:
-#         for meter in review_meters:
-#             plt.figure(figsize=(12, 3))
-#             plt.plot(data.index, data[meter], linewidth=1.2)
-#             plt.xlim(data_start, data_end)
-#             plt.title(meter)
-#             plt.xlabel("Datetime")
-#             plt.ylabel(ylabel)
-#             plt.grid(True, alpha=0.3)
-
-#             meter_broken = broken_df[broken_df["meter_name"] == meter]
-#             for _, row in meter_broken.iterrows():
-#                 plt.axvspan(row["start_datetime"], row["end_datetime"], alpha=0.2, color="red")
-
-#             meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
-#             for _, row in meter_candidates.iterrows():
-#                 issue_type = str(row["issue_type"]).strip().lower()
-#                 start_dt = pd.to_datetime(row["start_datetime"], errors="coerce")
-#                 end_dt = pd.to_datetime(row["end_datetime"], errors="coerce")
-
-#                 # For "restart_or_drop" issues, draw a vertical dashed line at the end datetime if it exists.
-#                 if issue_type == "restart_or_drop":
-#                     if pd.notna(end_dt):
-#                         # Black dashed line:
-#                         plt.axvline(
-#                             end_dt,
-#                             color="black",
-#                             linestyle="--",
-#                             linewidth=1.2,
-#                             alpha=0.9,
-#                         )
-#                 else:
-#                     # For other issue types, draw a blue shaded region if both start and end datetimes are valid.
-#                     if pd.notna(start_dt) and pd.notna(end_dt):
-#                         plt.axvspan(start_dt, end_dt, alpha=0.2, color="blue")
-
-#             issue_types = [
-#                 str(value).strip()
-#                 for value in pd.unique(meter_candidates["issue_type"].dropna())
-#                 if str(value).strip() != ""
-#             ]
-#             r2_values = [
-#                 format_r2_value(value)
-#                 for value in pd.unique(meter_candidates["r2"].dropna())
-#                 if format_r2_value(value) != ""
-#             ]
-
-#             annotation_lines = []
-#             if issue_types:
-#                 annotation_lines.append("Issue type: " + ", ".join(issue_types))
-#             if r2_values:
-#                 annotation_lines.append(", ".join(r2_values))
-
-#             if annotation_lines:
-#                 plt.text(
-#                     0.05, 0.95,
-#                     "\n".join(annotation_lines),
-#                     transform=plt.gca().transAxes,
-#                     ha="left", va="top",
-#                     fontsize=9,
-#                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.7)
-#                 )
-
-#             plt.tight_layout()
-#             pdf.savefig()
-#             plt.close()
-
-#     print(f"Review overlay plots saved to {plot_file}")
 
 
 
