@@ -109,6 +109,147 @@ def fill_missing_timestamps(df, freq):
 ###################################################################
 ###################################################################
 
+def select_meter_types_from_info(
+    data,
+    meter_info_file,
+    allowed_end_uses=("main", "submeter"),
+    excluded_meters=None,
+    datetime_col="datetime",
+):
+    """
+    Select meter columns using meter_info.csv and return a datetime indexed
+    dataframe plus a meter_name to end_use map.
+
+    This shared loader is used by both 1.kwh_end_points and meter_maintenance
+    so meter names and plot title labels are normalized consistently.
+
+    Parameters:
+    data : pd.DataFrame
+        Wide dataframe containing a datetime column and one column per meter.
+    meter_info_file : str
+        CSV containing at least meter_name and end_use.
+    allowed_end_uses : iterable[str]
+        End-use values to retain. Defaults to main and submeter.
+    excluded_meters : iterable[str] or None
+        Optional meter names to exclude, such as PV meters.
+    datetime_col : str
+        Name of the datetime column in data.
+
+    Returns:
+    selected_data : pd.DataFrame
+        Selected meter data with a sorted DatetimeIndex.
+    meter_type_map : dict
+        Normalized meter name mapped to normalized end_use.
+    selected_meter_info : pd.DataFrame
+        Normalized meter information for meters present in selected_data.
+    """
+    if data is None:
+        raise ValueError("data is None.")
+    if datetime_col not in data.columns:
+        raise ValueError(f"data is missing datetime column: {datetime_col}")
+
+    selected_data = data.copy()
+
+    normalized_columns = []
+    for col in selected_data.columns:
+        if col == datetime_col:
+            normalized_columns.append(datetime_col)
+        else:
+            normalized_columns.append(str(col).strip().lower())
+
+    duplicate_columns = pd.Index(normalized_columns)[
+        pd.Index(normalized_columns).duplicated()
+    ].unique().tolist()
+    if duplicate_columns:
+        raise ValueError(
+            "Meter columns become duplicated after normalization: "
+            + ", ".join(map(str, duplicate_columns))
+        )
+
+    selected_data.columns = normalized_columns
+
+    meter_info = pd.read_csv(meter_info_file, usecols=["meter_name", "end_use"]).copy()
+    meter_info["meter_name"] = (
+        meter_info["meter_name"]
+        .astype("string")
+        .str.strip()
+        .str.lower()
+    )
+    meter_info["end_use"] = (
+        meter_info["end_use"]
+        .astype("string")
+        .str.strip()
+        .str.lower()
+    )
+
+    allowed = {
+        str(value).strip().lower()
+        for value in allowed_end_uses
+        if str(value).strip() != ""
+    }
+    excluded = {
+        str(value).strip().lower()
+        for value in (excluded_meters or [])
+        if str(value).strip() != ""
+    }
+
+    selected_meter_info = meter_info[
+        meter_info["end_use"].isin(allowed)
+        & ~meter_info["meter_name"].isin(excluded)
+    ].copy()
+    selected_meter_info = selected_meter_info.drop_duplicates(
+        subset="meter_name",
+        keep="last",
+    )
+
+    meter_type_map = (
+        selected_meter_info
+        .set_index("meter_name")["end_use"]
+        .to_dict()
+    )
+
+    selected_meter_columns = [
+        meter_name
+        for meter_name in selected_data.columns
+        if meter_name != datetime_col and meter_name in meter_type_map
+    ]
+
+    selected_data = selected_data[
+        [datetime_col] + selected_meter_columns
+    ].copy()
+    selected_data[datetime_col] = pd.to_datetime(
+        selected_data[datetime_col],
+        errors="coerce",
+    )
+    selected_data = (
+        selected_data
+        .dropna(subset=[datetime_col])
+        .set_index(datetime_col)
+        .sort_index()
+    )
+
+    selected_meter_info = selected_meter_info[
+        selected_meter_info["meter_name"].isin(selected_meter_columns)
+    ].reset_index(drop=True)
+
+    selected_counts = pd.Series(
+        [meter_type_map[meter] for meter in selected_meter_columns],
+        dtype="string",
+    ).value_counts()
+
+    count_text = ", ".join(
+        f"{int(selected_counts.get(end_use, 0))} {end_use}"
+        for end_use in sorted(allowed)
+    )
+    print(f"Selected {len(selected_meter_columns)} meters: {count_text}.")
+
+    return selected_data, meter_type_map, selected_meter_info
+
+
+
+###################################################################
+###################################################################
+
 def resolve_analysis_window(index, start_time, end_time):
     """
     Check requested analysis timestamps to timestamps that
@@ -237,7 +378,7 @@ def export_removed_special_meter_data(
     This function does not modify the input data. It preserves the raw values
     that would later be removed from the working dataframe.
 
-    Args:
+    Parameters:
         data (pd.DataFrame): Wide meter dataframe with a DatetimeIndex.
         special_meters_file (str): CSV file with correction rows.
         output_csv (str or None): Optional CSV output path.
@@ -706,7 +847,7 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
 
 
 # loader for the candidate workbook used by the review workflow.
-def _load_existing_candidates(candidate_file):
+def load_existing_candidates(candidate_file):
     cols = [
         "meter_name",
         "solution",
@@ -747,43 +888,6 @@ def _load_existing_candidates(candidate_file):
 
     return df.reset_index(drop=True)
 
-
-# TODO: consider re-adding this loader for the official meter issues file if needed in the future.
-# used to load "offical" meter issues file (meter_issues_file var) for the master corrections workflow
-# (for meter_issues_file + candidate_file + broken_meters_file)
-# def _load_base_master_corrections(meter_issues_file):
-#     '''
-#     Load the base master corrections file from the official meter issues csv.
-#     '''
-#     cols = [
-#         "meter_name", "solution", "start_datetime", "end_datetime",
-#         "issue_type/status", "description"
-#     ]
-#     if meter_issues_file is None or not os.path.exists(meter_issues_file):
-#         return pd.DataFrame(columns=cols)
-
-#     df = pd.read_csv(meter_issues_file)
-
-#     if "issue_type" in df.columns and "issue_type/status" not in df.columns:
-#         df = df.rename(columns={"issue_type": "issue_type/status"})
-#     if "status" in df.columns and "issue_type/status" not in df.columns:
-#         df = df.rename(columns={"status": "issue_type/status"})
-#     if "details" in df.columns and "description" not in df.columns:
-#         df = df.rename(columns={"details": "description"})
-
-#     for col in cols:
-#         if col not in df.columns:
-#             df[col] = "" if col in {"meter_name", "solution", "issue_type/status", "description"} else pd.NaT
-
-#     df = df[cols].copy()
-#     df["meter_name"] = df["meter_name"].apply(_normalize_text)
-#     df["solution"] = df["solution"].fillna("").astype(str).str.strip().str.lower()
-#     df["start_datetime"] = _parse_strict_date_series(df["start_datetime"], "start_datetime")
-#     df["end_datetime"] = _parse_strict_date_series(df["end_datetime"], "end_datetime")
-#     df["issue_type/status"] = df["issue_type/status"].fillna("").astype(str).str.strip()
-#     df["description"] = df["description"].fillna("").astype(str).str.strip()
-
-#     return df.reset_index(drop=True)
 
 
 # simple dedupe key builder for merged master/candidate rows.
@@ -839,7 +943,7 @@ def sync_meter_corrections_master_sheet(
     ]
     master_df = pd.DataFrame(columns=master_cols)
 
-    existing_candidates = _load_existing_candidates(candidate_file)
+    existing_candidates = load_existing_candidates(candidate_file)
     broken_df = load_broken_meter_workbook(broken_meters_file)
 
     approved_candidates = existing_candidates[
@@ -1015,7 +1119,7 @@ def update_special_meter_candidates_workbook(
 
         return rows
 
-    existing_candidates = _load_existing_candidates(candidate_file)
+    existing_candidates = load_existing_candidates(candidate_file)
     unresolved_candidates = existing_candidates[
         existing_candidates["approved"] != 1
     ].copy()
@@ -1257,14 +1361,12 @@ def update_special_meter_candidates_workbook(
 ###################################################################
 
 
-def _get_review_plot_legend_handles():
-    """
-    Return one consistent set of legend entries for review meter PDF pages.
-
-    Proxy artists are used so repeated intervals do not create duplicate
-    legend entries.
-    """
-    return [
+def get_review_plot_legend_handles(
+    include_candidates=True,
+    include_removed=False,
+):
+    """Return consistent legend entries for endpoint and maintenance PDFs."""
+    handles = [
         Line2D(
             [0],
             [0],
@@ -1278,21 +1380,40 @@ def _get_review_plot_legend_handles():
             alpha=0.20,
             label="Broken meter interval",
         ),
-        Patch(
-            facecolor="blue",
-            edgecolor="blue",
-            alpha=0.20,
-            label="Candidate issue interval",
-        ),
-        Line2D(
-            [0],
-            [0],
-            color="black",
-            linestyle="--",
-            linewidth=1.2,
-            label="Restart / drop event",
-        ),
     ]
+
+    if include_candidates:
+        handles.extend([
+            Patch(
+                facecolor="blue",
+                edgecolor="blue",
+                alpha=0.20,
+                label="Candidate issue interval",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linestyle="--",
+                linewidth=1.2,
+                label="Restart / drop event",
+            ),
+        ])
+
+    if include_removed:
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="orange",
+                marker="o",
+                linestyle="None",
+                markersize=6,
+                label="Removed raw reading",
+            )
+        )
+
+    return handles
 
 
 def _add_pdf_legend_page(
@@ -1339,7 +1460,7 @@ def _add_pdf_legend_page(
             wrap=True,
         )
 
-    legend = ax.legend(
+    ax.legend(
         handles=handles,
         loc="center",
         bbox_to_anchor=(0.50, 0.55),
@@ -1354,7 +1475,6 @@ def _add_pdf_legend_page(
 
     if notes:
         note_text = "\n".join(f"• {note}" for note in notes)
-
         fig.text(
             0.50,
             0.23,
@@ -1380,6 +1500,313 @@ def _add_pdf_legend_page(
     plt.close(fig)
 
 
+def _format_review_r2_value(r2_val):
+    if pd.isna(r2_val):
+        return ""
+    try:
+        r2_float = float(r2_val)
+        if r2_float > 0:
+            return f"R² = {r2_float:.4f}"
+        return f"R² = {int(r2_float)}"
+    except (TypeError, ValueError):
+        return f"R² = {r2_val}"
+    
+
+def _plot_single_meter_review(
+    meter_name,
+    data,
+    broken_df=None,
+    candidate_df=None,
+    removed_df=None,
+    meter_type_map=None,
+    zoom_start=None,
+    zoom_end=None,
+    ylabel="kWh",
+    annotation_fields=("issue_type", "r2"),
+    title_suffix="",
+    footer_note="",
+):
+    """
+    Draw one review meter graph.
+
+    This is the shared plotting engine used by endpoint review PDFs,
+    maintenance review PDFs, and approved change preview PDFs.
+    """
+    if data is None or data.empty:
+        raise ValueError("data is empty.")
+
+    meter_name_norm = str(meter_name).strip().lower()
+    data_columns_by_name = {
+        str(col).strip().lower(): col
+        for col in data.columns
+    }
+
+    if meter_name_norm not in data_columns_by_name:
+        print(f"{meter_name} not found in selected main/submeter data.")
+        return None
+
+    data_col = data_columns_by_name[meter_name_norm]
+    meter_series = data[data_col].copy()
+    meter_series.index = pd.to_datetime(meter_series.index, errors="coerce")
+    meter_series = meter_series[~meter_series.index.isna()].sort_index()
+
+    if meter_series.empty:
+        print(f"{meter_name} has no valid timestamps to plot.")
+        return None
+
+    broken_df = pd.DataFrame() if broken_df is None else broken_df.copy()
+    candidate_df = pd.DataFrame() if candidate_df is None else candidate_df.copy()
+    removed_df = pd.DataFrame() if removed_df is None else removed_df.copy()
+
+    if "meter_name" in broken_df.columns:
+        broken_meter_names = (
+            broken_df["meter_name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        meter_broken = broken_df[broken_meter_names.eq(meter_name_norm)].copy()
+    else:
+        meter_broken = pd.DataFrame()
+
+    if "meter_name" in candidate_df.columns:
+        candidate_meter_names = (
+            candidate_df["meter_name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        meter_candidates = candidate_df[
+            candidate_meter_names.eq(meter_name_norm)
+        ].copy()
+    else:
+        meter_candidates = pd.DataFrame()
+
+    if "meter_name" in removed_df.columns:
+        removed_meter_names = (
+            removed_df["meter_name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+        meter_removed = removed_df[
+            removed_meter_names.eq(meter_name_norm)
+        ].copy()
+    else:
+        meter_removed = pd.DataFrame()
+
+    plot_start = pd.to_datetime(meter_series.index.min())
+    plot_end = pd.to_datetime(meter_series.index.max())
+
+    if zoom_start is not None:
+        plot_start = max(plot_start, pd.to_datetime(zoom_start))
+    if zoom_end is not None:
+        plot_end = min(plot_end, pd.to_datetime(zoom_end))
+    if plot_start > plot_end:
+        raise ValueError(
+            f"Resolved plot window is empty for meter '{meter_name_norm}'."
+        )
+
+    fig, ax = plt.subplots(figsize=(14, 3.5))
+    ax.plot(
+        meter_series.index,
+        meter_series.values,
+        color="#1f77b4",
+        linewidth=1.2,
+    )
+    ax.set_xlim(plot_start, plot_end)
+
+    # label meter '[main]' or '[sub]' on plot
+    meter_type = ""
+    if meter_type_map is not None:
+        normalized_type_map = {
+            str(key).strip().lower(): str(value).strip().lower()
+            for key, value in meter_type_map.items()
+        }
+        meter_type = normalized_type_map.get(meter_name_norm, "")
+
+    meter_title = (
+        f"{meter_name_norm} [{meter_type}]"
+        if meter_type in {"main", "submeter"}
+        else meter_name_norm
+    )
+    if title_suffix:
+        meter_title = f"{meter_title}{title_suffix}"
+
+    ax.set_title(meter_title)
+    ax.set_xlabel("Datetime")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+
+    broken_start_col = None
+    broken_end_col = None
+    if {"start_date", "end_date"}.issubset(meter_broken.columns):
+        broken_start_col = "start_date"
+        broken_end_col = "end_date"
+    elif {"start_datetime", "end_datetime"}.issubset(meter_broken.columns):
+        broken_start_col = "start_datetime"
+        broken_end_col = "end_datetime"
+
+    if broken_start_col is not None:
+        for _, row in meter_broken.iterrows():
+            raw_start = pd.to_datetime(row[broken_start_col], errors="coerce")
+            raw_end = pd.to_datetime(row[broken_end_col], errors="coerce")
+            start = plot_start if pd.isna(raw_start) else max(raw_start, plot_start)
+            end = plot_end if pd.isna(raw_end) else min(raw_end, plot_end)
+
+            if start <= end:
+                ax.axvspan(
+                    start,
+                    end,
+                    facecolor="red",
+                    edgecolor="red",
+                    alpha=0.20,
+                )
+
+    if not meter_candidates.empty:
+        for _, row in meter_candidates.iterrows():
+            issue_type = str(row.get("issue_type", "")).strip().lower()
+            start = pd.to_datetime(
+                row.get("start_datetime", pd.NaT),
+                errors="coerce",
+            )
+            end = pd.to_datetime(
+                row.get("end_datetime", pd.NaT),
+                errors="coerce",
+            )
+
+            if issue_type == "restart_or_drop":
+                if pd.notna(end) and plot_start <= end <= plot_end:
+                    ax.axvline(
+                        end,
+                        color="black",
+                        linestyle="--",
+                        linewidth=1.2,
+                        alpha=0.9,
+                    )
+            elif pd.notna(start) and pd.notna(end):
+                start = max(start, plot_start)
+                end = min(end, plot_end)
+                if start <= end:
+                    ax.axvspan(
+                        start,
+                        end,
+                        facecolor="blue",
+                        edgecolor="blue",
+                        alpha=0.20,
+                    )
+
+    removed_plot = pd.DataFrame()
+    if (
+        not meter_removed.empty
+        and "datetime" in meter_removed.columns
+        and "meter_reading" in meter_removed.columns
+    ):
+        meter_removed["datetime"] = pd.to_datetime(
+            meter_removed["datetime"],
+            errors="coerce",
+        )
+        removed_plot = meter_removed[
+            meter_removed["datetime"].between(
+                plot_start,
+                plot_end,
+                inclusive="both",
+            )
+        ].copy()
+
+        if not removed_plot.empty:
+            ax.scatter(
+                removed_plot["datetime"],
+                removed_plot["meter_reading"],
+                s=10,
+                alpha=0.8,
+                marker="o",
+                color="orange",
+            )
+
+    annotation_lines = []
+
+    if "status" in annotation_fields and "status" in meter_broken.columns:
+        status_values = [
+            str(value).strip()
+            for value in pd.unique(meter_broken["status"].dropna())
+            if str(value).strip() != ""
+        ]
+        if status_values:
+            annotation_lines.append(
+                "Broken status: " + ", ".join(status_values)
+            )
+
+    if (
+        "issue_type" in annotation_fields
+        and "issue_type" in meter_candidates.columns
+    ):
+        issue_types = [
+            str(value).strip()
+            for value in pd.unique(meter_candidates["issue_type"].dropna())
+            if str(value).strip() != ""
+        ]
+        if issue_types:
+            label = (
+                "Candidate issue type: "
+                if "status" in annotation_fields
+                else "Issue type: "
+            )
+            annotation_lines.append(label + ", ".join(issue_types))
+
+    if "r2" in annotation_fields and "r2" in meter_candidates.columns:
+        r2_values = [
+            _format_review_r2_value(value)
+            for value in pd.unique(meter_candidates["r2"].dropna())
+            if _format_review_r2_value(value) != ""
+        ]
+        if r2_values:
+            annotation_lines.append(", ".join(r2_values))
+
+    if "removed_count" in annotation_fields and not meter_removed.empty:
+        annotation_lines.append(f"Removed raw points: {len(meter_removed)}")
+
+    if annotation_lines:
+        ax.text(
+            0.02,
+            0.97,
+            "\n".join(annotation_lines),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=9,
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                facecolor="white",
+                edgecolor="gray",
+                alpha=0.80,
+            ),
+        )
+
+    if footer_note:
+        ax.text(
+            0.99,
+            0.02,
+            footer_note,
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                facecolor="white",
+                edgecolor="gray",
+                alpha=0.80,
+            ),
+        )
+
+    fig.tight_layout()
+    return fig
+
+
 def plot_all_meters_to_pdf(
     data,
     plot_file,
@@ -1396,7 +1823,7 @@ def plot_all_meters_to_pdf(
     """
     if data is None or data.empty:
         print("No data available for all-meter plotting.")
-        return
+        return 0
 
     output_dir = os.path.dirname(str(plot_file))
     if output_dir:
@@ -1408,6 +1835,7 @@ def plot_all_meters_to_pdf(
 
     data_start = pd.to_datetime(data.index.min())
     data_end = pd.to_datetime(data.index.max())
+    saved_count = 0
 
     with PdfPages(plot_file) as pdf:
         all_meter_legend_handles = [
@@ -1420,7 +1848,6 @@ def plot_all_meters_to_pdf(
             ),
         ]
 
-        # Page 1: standalone plot key
         _add_pdf_legend_page(
             pdf=pdf,
             title="All Corrected Meter Plots",
@@ -1436,11 +1863,13 @@ def plot_all_meters_to_pdf(
             ],
         )
 
-        # Pages 2 onward: meter plots
-        for meter_name in data.columns:
-            # Extra width leaves room for the legend and explanatory note.
-            fig, ax = plt.subplots(figsize=(14, 3.5))
+        normalized_type_map = {
+            str(key).strip().lower(): str(value).strip().lower()
+            for key, value in (meter_type_map or {}).items()
+        }
 
+        for meter_name in data.columns:
+            fig, ax = plt.subplots(figsize=(14, 3.5))
             ax.plot(
                 data.index,
                 data[meter_name],
@@ -1448,14 +1877,10 @@ def plot_all_meters_to_pdf(
                 linewidth=1.2,
                 label=line_label,
             )
-
             ax.set_xlim(data_start, data_end)
 
-            # label meter '[main]' or '[sub]' on plot
-            meter_type = ""
-            if meter_type_map is not None:
-                meter_type = str(meter_type_map.get(meter_name, "")).strip()
-
+            meter_name_norm = str(meter_name).strip().lower()
+            meter_type = normalized_type_map.get(meter_name_norm, "")
             meter_title = (
                 f"{meter_name} [{meter_type}]"
                 if meter_type
@@ -1469,12 +1894,13 @@ def plot_all_meters_to_pdf(
             fig.tight_layout()
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
+            saved_count += 1
 
     print(f"All-meter plots saved to {plot_file}")
+    return saved_count
 
 
 
-# review plotting with red broken meter overlays and blue candidate overlays.
 def plot_review_meters_with_overlays(
     data,
     candidate_file,
@@ -1482,64 +1908,42 @@ def plot_review_meters_with_overlays(
     plot_file,
     ylabel="kWh",
     meter_type_map=None,
-    ):
-    
+):
+    """
+    Create the kwh_end_points.ipynb review PDF using the shared meter plot function
+    with red broken meter overlays and blue candidate overlays.
+    """
     if data is None or data.empty:
         raise ValueError("data is empty.")
 
-    data = data.copy()
-    data.index = pd.to_datetime(data.index, errors="coerce")
-    data = data.sort_index()
-
-    data_start = pd.to_datetime(data.index.min())
-    data_end = pd.to_datetime(data.index.max())
-
-    candidate_df = _load_existing_candidates(candidate_file).copy()
-
+    candidate_df = load_existing_candidates(candidate_file)
     broken_source_df = load_broken_meter_workbook(broken_meters_file)
-    broken_plot_rows = []
-    for _, row in broken_source_df.iterrows():
-        start = data_start if pd.isna(row["start_date"]) else max(pd.to_datetime(row["start_date"]), data_start)
-        end = data_end if pd.isna(row["end_date"]) else min(pd.to_datetime(row["end_date"]), data_end)
-        if start <= end:
-            broken_plot_rows.append({
-                "meter_name": row["meter_name"],
-                "start_datetime": start,
-                "end_datetime": end,
-            })
 
-    broken_df = pd.DataFrame(broken_plot_rows, columns=["meter_name", "start_datetime", "end_datetime"])
+    candidate_meters = set(candidate_df.get("meter_name", pd.Series(dtype=str)))
+    broken_meters = set(broken_source_df.get("meter_name", pd.Series(dtype=str)))
+    data_meters = {str(col).strip().lower() for col in data.columns}
 
     review_meters = sorted(
-        (set(candidate_df["meter_name"]) | set(broken_df["meter_name"]))
-        & set(data.columns)
+        (candidate_meters | broken_meters) & data_meters
     )
 
     if not review_meters:
         print("No review meters found in data.")
-        return
+        return 0
 
     output_dir = os.path.dirname(str(plot_file))
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    def format_r2_value(r2_val):
-        if pd.isna(r2_val):
-            return ""
-        try:
-            r2_float = float(r2_val)
-            if r2_float > 0:
-                return f"R² = {r2_float:.4f}"
-            return f"R² = {int(r2_float)}"
-        except (TypeError, ValueError):
-            return f"R² = {r2_val}"
-
+    saved_count = 0
     with PdfPages(plot_file) as pdf:
-        # Page 1: standalone plot key
         _add_pdf_legend_page(
             pdf=pdf,
             title="Review Meter Plots",
-            handles=_get_review_plot_legend_handles(),
+            handles=get_review_plot_legend_handles(
+                include_candidates=True,
+                include_removed=False,
+            ),
             description=(
                 "These plots show raw meter readings together with broken meter "
                 "intervals and unresolved candidate issues."
@@ -1551,112 +1955,664 @@ def plot_review_meters_with_overlays(
             ],
         )
 
-            # Pages 2 onward: meter plots
-        for meter in review_meters:
-            fig, ax = plt.subplots(figsize=(14, 3.5))
-
-            ax.plot(
-                data.index,
-                data[meter],
-                color="#1f77b4",
-                linewidth=1.2,
+        for meter_name in review_meters:
+            fig = _plot_single_meter_review(
+                meter_name=meter_name,
+                data=data,
+                broken_df=broken_source_df,
+                candidate_df=candidate_df,
+                removed_df=None,
+                meter_type_map=meter_type_map,
+                ylabel=ylabel,
+                annotation_fields=("issue_type", "r2"),
             )
-
-            ax.set_xlim(data_start, data_end)
-
-            # label meter '[main]' or '[sub]' on plot
-            meter_type = ""
-            if meter_type_map is not None:
-                meter_type = str(meter_type_map.get(meter, "")).strip()
-
-            meter_title = (
-                f"{meter} [{meter_type}]"
-                if meter_type
-                else str(meter)
-            )
-            ax.set_title(meter_title)
-            ax.set_xlabel("Datetime")
-            ax.set_ylabel(ylabel)
-            ax.grid(True, alpha=0.3)
-
-            meter_broken = broken_df[broken_df["meter_name"] == meter]
-
-            for _, row in meter_broken.iterrows():
-                    ax.axvspan(
-                        row["start_datetime"],
-                        row["end_datetime"],
-                        facecolor="red",
-                        edgecolor="red",
-                        alpha=0.20,
-                    )
-
-            meter_candidates = candidate_df[candidate_df["meter_name"] == meter].copy()
-            for _, row in meter_candidates.iterrows():
-                issue_type = str(row["issue_type"]).strip().lower()
-                start_dt = pd.to_datetime(row["start_datetime"], errors="coerce")
-                end_dt = pd.to_datetime(row["end_datetime"], errors="coerce")
-
-                # For "restart_or_drop" issues, draw a vertical dashed line at the end datetime if it exists.
-                if issue_type == "restart_or_drop":
-                    if pd.notna(end_dt):
-                        # Black dashed line:
-                        ax.axvline(
-                            end_dt,
-                            color="black",
-                            linestyle="--",
-                            linewidth=1.2,
-                            alpha=0.9,
-                        )
-                else:
-                    # For other issue types, draw a blue shaded region if both start and end datetimes are valid.
-                    if pd.notna(start_dt) and pd.notna(end_dt):
-                        ax.axvspan(
-                            start_dt,
-                            end_dt,
-                            facecolor="blue",
-                            edgecolor="blue",
-                            alpha=0.20,
-                        )
-
-            issue_types = [
-                str(value).strip()
-                for value in pd.unique(meter_candidates["issue_type"].dropna())
-                if str(value).strip() != ""
-            ]
-            r2_values = [
-                format_r2_value(value)
-                for value in pd.unique(meter_candidates["r2"].dropna())
-                if format_r2_value(value) != ""
-            ]
-
-            annotation_lines = []
-            if issue_types:
-                annotation_lines.append("Issue type: " + ", ".join(issue_types))
-            if r2_values:
-                annotation_lines.append(", ".join(r2_values))
-
-            if annotation_lines:
-                ax.text(
-                    0.02,
-                    0.97,
-                    "\n".join(annotation_lines),
-                    transform=ax.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=9,
-                    bbox=dict(
-                        boxstyle="round,pad=0.3",
-                        facecolor="white",
-                        edgecolor="gray",
-                        alpha=0.80,
-                    ),
-                )
-
-            fig.tight_layout()
+            if fig is None:
+                continue
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
+            saved_count += 1
 
     print(f"Review overlay plots saved to {plot_file}")
+    return saved_count
+
+
+# meter maintenance ploting:
+def plot_meter_maintenance_review_pdf(
+    data,
+    meters_to_review,
+    broken_df,
+    candidate_df,
+    removed_df,
+    plot_file,
+    meter_type_map=None,
+    zoom_start=None,
+    zoom_end=None,
+    ylabel="kWh",
+    show_plots=False,
+):
+    """
+    Create the selected meter maintenance review PDF using the shared meter plot function
+    with red broken meter overlays and blue candidate overlays, and also 
+    orange data markers for removed meter data.
+    """
+    meters_to_review = [
+        str(meter).strip().lower()
+        for meter in (meters_to_review or [])
+        if str(meter).strip() != ""
+    ]
+    if not meters_to_review:
+        print("No selected main or submeter review meters were found.")
+        return 0
+
+    output_dir = os.path.dirname(str(plot_file))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    saved_count = 0
+    with PdfPages(plot_file) as pdf:
+        _add_pdf_legend_page(
+            pdf=pdf,
+            title="Meter Maintenance Review Plots",
+            handles=get_review_plot_legend_handles(
+                include_candidates=True,
+                include_removed=True,
+            ),
+            description=(
+                "These plots show raw readings for selected main meters and "
+                "submeters together with maintenance review overlays."
+            ),
+            notes=[
+                "Every plot title identifies the meter as [main] or [submeter].",
+                "Red and blue intervals may overlap and appear purple.",
+                "Orange points preserve readings removed by an approved correction.",
+            ],
+        )
+
+        for meter_name in meters_to_review:
+            fig = _plot_single_meter_review(
+                meter_name=meter_name,
+                data=data,
+                broken_df=broken_df,
+                candidate_df=candidate_df,
+                removed_df=removed_df,
+                meter_type_map=meter_type_map,
+                zoom_start=zoom_start,
+                zoom_end=zoom_end,
+                ylabel=ylabel,
+                annotation_fields=(
+                    "status",
+                    "issue_type",
+                    "removed_count",
+                ),
+            )
+            if fig is None:
+                continue
+            pdf.savefig(fig, bbox_inches="tight")
+            if show_plots:
+                plt.show()
+            plt.close(fig)
+            saved_count += 1
+
+    if saved_count:
+        print(f"Saved maintenance review plots to {plot_file}")
+    return saved_count
+
+
+def plot_approved_maintenance_preview_pdf(
+    data,
+    changed_meters,
+    reviewed_broken_df,
+    plot_file,
+    meter_type_map=None,
+    zoom_start=None,
+    zoom_end=None,
+    ylabel="kWh",
+    show_plots=False,
+):
+    """
+    Preview approved broken meter changes before overwriting the source CSV.
+    """
+    changed_meters = [
+        str(meter).strip().lower()
+        for meter in (changed_meters or [])
+        if str(meter).strip() != ""
+    ]
+    if not changed_meters:
+        print("No approved maintenance changes were available to preview.")
+        return 0
+
+    output_dir = os.path.dirname(str(plot_file))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    saved_count = 0
+    with PdfPages(plot_file) as pdf:
+        _add_pdf_legend_page(
+            pdf=pdf,
+            title="Approved Maintenance Changes Preview",
+            handles=get_review_plot_legend_handles(
+                include_candidates=False,
+                include_removed=False,
+            ),
+            description=(
+                "These plots preview approved broken meter interval changes "
+                "before the source running list is overwritten."
+            ),
+            notes=[
+                "Every plot title identifies the meter as [main] or [submeter].",
+                "Red shading shows the proposed post action broken interval.",
+                "Candidate and removed data overlays are intentionally omitted.",
+            ],
+        )
+
+        for meter_name in changed_meters:
+            fig = _plot_single_meter_review(
+                meter_name=meter_name,
+                data=data,
+                broken_df=reviewed_broken_df,
+                candidate_df=None,
+                removed_df=None,
+                meter_type_map=meter_type_map,
+                zoom_start=zoom_start,
+                zoom_end=zoom_end,
+                ylabel=ylabel,
+                annotation_fields=("status",),
+                title_suffix=" — approved broken interval preview",
+                footer_note=(
+                    "Red = updated broken interval\n"
+                    "running_list_broken_meters.csv has not been changed\n"
+                    "Candidates and removed data points are not regenerated yet"
+                ),
+            )
+            if fig is None:
+                continue
+            pdf.savefig(fig, bbox_inches="tight")
+            if show_plots:
+                plt.show()
+            plt.close(fig)
+            saved_count += 1
+
+    if saved_count:
+        print(
+            f"Saved {saved_count} approved change preview plots to {plot_file}."
+        )
+    return saved_count
+
+
+
+###################################################################
+# METER MAINTENANCE UPDATE LOG WORKFLOW
+###################################################################
+
+BROKEN_UPDATE_LOG_COLUMNS = [
+    "meter_name",
+    "source_start_date",
+    "source_end_date",
+    "source_status",
+    "source_description",
+    "action",
+    "new_start_date",
+    "new_end_date",
+    "new_status",
+    "new_description",
+    "reason",
+    "approved",
+]
+
+REQUIRED_BROKEN_METER_COLUMNS = [
+    "meter_name",
+    "start_date",
+    "end_date",
+    "status",
+    "description",
+    "data_source",
+    "updated_data",
+]
+
+
+def datetime_to_text(value):
+    """
+    Convert a scalar datetime-like value to the workflow CSV format.
+    Returns an empty string for NaT or invalid values.
+    """
+    if pd.isna(value) or value == "":
+        return ""
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_strict_datetime_value(value, field_name):
+    """
+    Parse one maintenance log datetime using the shared strict formats.
+    Returns pd.NaT for empty or invalid values.
+    """
+    value = "" if pd.isna(value) else str(value).strip()
+    if value == "":
+        return pd.NaT
+    return _parse_strict_date_series(
+        pd.Series([value]),
+        field_name,
+    ).iloc[0]
+
+
+def _build_update_key(df):
+    temp = df.copy()
+    for col in [
+        "meter_name",
+        "source_start_date",
+        "source_end_date",
+        "source_status",
+    ]:
+        if col not in temp.columns:
+            temp[col] = ""
+        temp[col] = temp[col].fillna("").astype(str).str.strip().str.lower()
+    return (
+        temp["meter_name"] + "||"
+        + temp["source_start_date"] + "||"
+        + temp["source_end_date"] + "||"
+        + temp["source_status"]
+    )
+
+
+def prepare_broken_meter_update_log(
+    update_log_file,
+    broken_source_df,
+    meters_to_review,
+    refresh_selected_meters=True,
+):
+    """
+    Create/load the maintenance update log and refresh selected source rows.
+    """
+    output_dir = os.path.dirname(str(update_log_file))
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    if os.path.exists(update_log_file):
+        update_log_df = pd.read_csv(update_log_file)
+        missing_cols = [
+            col
+            for col in BROKEN_UPDATE_LOG_COLUMNS
+            if col not in update_log_df.columns
+        ]
+        if missing_cols:
+            raise ValueError(
+                f"Update log file is missing columns: {missing_cols}"
+            )
+    else:
+        update_log_df = pd.DataFrame(columns=BROKEN_UPDATE_LOG_COLUMNS)
+        update_log_df.to_csv(update_log_file, index=False)
+        print(f"Created new update log: {update_log_file}")
+
+    normalized_meters = [
+        _normalize_text(meter)
+        for meter in (meters_to_review or [])
+        if _normalize_text(meter) != ""
+    ]
+
+    # Refresh the update log with the current source rows for the selected meters.
+    if refresh_selected_meters and normalized_meters:
+        selected_rows = []
+
+        for meter_name in normalized_meters:
+            meter_source = broken_source_df[
+                broken_source_df["meter_name"].eq(meter_name)
+            ].copy()
+
+            if meter_source.empty:
+                selected_rows.append({
+                    "meter_name": meter_name,
+                    "source_start_date": "",
+                    "source_end_date": "",
+                    "source_status": "",
+                    "source_description": "",
+                    "action": "",
+                    "new_start_date": "",
+                    "new_end_date": "",
+                    "new_status": "",
+                    "new_description": "",
+                    "reason": "",
+                    "approved": 0,
+                })
+            else:
+                for _, row in meter_source.iterrows():
+                    selected_rows.append({
+                        "meter_name": meter_name,
+                        "source_start_date": datetime_to_text(row["start_date"]),
+                        "source_end_date": datetime_to_text(row["end_date"]),
+                        "source_status": str(row["status"]).strip(),
+                        "source_description": str(row["description"]).strip(),
+                        "action": "",
+                        "new_start_date": "",
+                        "new_end_date": "",
+                        "new_status": "",
+                        "new_description": "",
+                        "reason": "",
+                        "approved": 0,
+                    })
+
+        selected_log_df = pd.DataFrame(
+            selected_rows,
+            columns=BROKEN_UPDATE_LOG_COLUMNS,
+        )
+
+        update_log_df["_key"] = _build_update_key(update_log_df)
+        selected_log_df["_key"] = _build_update_key(selected_log_df)
+
+        selected_keys = set(selected_log_df["_key"])
+        preserved_existing = update_log_df[update_log_df["_key"].isin(selected_keys)].copy()
+        preserved_other = update_log_df[~update_log_df["_key"].isin(selected_keys)].copy()
+
+        combined_refresh_rows = pd.concat(
+            [preserved_existing, selected_log_df],
+            ignore_index=True,
+            sort=False,
+        )
+        combined_refresh_rows = combined_refresh_rows.drop_duplicates(
+            subset="_key",
+            keep="first",
+        )
+        update_log_df = pd.concat(
+            [preserved_other, combined_refresh_rows],
+            ignore_index=True,
+            sort=False,
+        )
+        update_log_df = update_log_df.drop(
+            columns="_key",
+            errors="ignore",
+        )
+
+    update_log_df["approved"] = (
+        pd.to_numeric(update_log_df["approved"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+    update_log_df = update_log_df[BROKEN_UPDATE_LOG_COLUMNS].copy()
+    update_log_df.to_csv(update_log_file, index=False)
+    return update_log_df
+
+
+def _match_existing_broken_rows(df, log_row):
+    meter_name = _normalize_text(log_row["meter_name"])
+    src_start = datetime_to_text(log_row["source_start_date"])
+    src_end = datetime_to_text(log_row["source_end_date"])
+    src_status = _normalize_text(log_row["source_status"], underscore=True)
+    src_desc = _normalize_text(log_row["source_description"])
+
+    mask = (
+        df["meter_name"].fillna("").astype(str).str.strip().str.lower().eq(meter_name)
+        & df["status"].fillna("").astype(str).str.strip().str.lower().eq(src_status)
+        & df["description"].fillna("").astype(str).str.strip().str.lower().eq(src_desc)
+    )
+
+    start_text = df["start_date"].apply(datetime_to_text)
+    end_text = df["end_date"].apply(datetime_to_text)
+    mask = mask & start_text.eq(src_start) & end_text.eq(src_end)
+    return df[mask]
+
+
+def _log_value_is_filled(value):
+    return not pd.isna(value) and str(value).strip() != ""
+
+
+def apply_broken_meter_update_actions(
+    broken_source_df,
+    update_log_df,
+    reviewed_copy_file=None,
+    now_ts=None,
+):
+    """
+    Parameters
+    broken_source_df : pd.DataFrame
+        The current running list of broken meter intervals.
+    Apply approved add/update/remove actions to a copy of the running list.
+
+    The source dataframe is never modified in place. When reviewed_copy_file is
+    supplied, the complete reviewed dataframe overwrites that copy file.
+    """
+    approved_actions = {"update", "remove", "add"}
+
+    approved_update_rows = update_log_df[
+        pd.to_numeric(update_log_df["approved"], errors="coerce")
+        .fillna(0)
+        .astype(int)
+        .eq(1)
+    ].copy()
+    approved_update_rows["action"] = (
+        approved_update_rows["action"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    invalid_actions = sorted([
+        action
+        for action in approved_update_rows["action"].unique()
+        if action not in approved_actions
+    ])
+    if invalid_actions:
+        raise ValueError(
+            f"Unsupported action values in approved rows: {invalid_actions}"
+        )
+
+    reviewed_broken_df = broken_source_df.copy()
+    for col in REQUIRED_BROKEN_METER_COLUMNS:
+        if col not in reviewed_broken_df.columns:
+            reviewed_broken_df[col] = pd.NaT if "date" in col else ""
+
+    reviewed_broken_df["meter_name"] = reviewed_broken_df["meter_name"].apply(_normalize_text)
+    reviewed_broken_df["status"] = reviewed_broken_df["status"].apply(lambda value: _normalize_text(value, underscore=True))
+    reviewed_broken_df["description"] = reviewed_broken_df["description"].apply(_normalize_text)
+    reviewed_broken_df["data_source"] = reviewed_broken_df["data_source"].apply(_normalize_text)
+    reviewed_broken_df["start_date"] = pd.to_datetime(reviewed_broken_df["start_date"], errors="coerce")
+    reviewed_broken_df["end_date"] = pd.to_datetime(reviewed_broken_df["end_date"], errors="coerce")
+    reviewed_broken_df["updated_data"] = pd.to_datetime(reviewed_broken_df["updated_data"], errors="coerce")
+
+    applied_change_log = []
+    if now_ts is None:
+        now_ts = pd.Timestamp.now().floor("s")
+    else:
+        now_ts = pd.to_datetime(now_ts).floor("s")
+
+    for _, log_row in approved_update_rows.iterrows():
+        action = log_row["action"]
+        meter_name = _normalize_text(log_row["meter_name"])
+
+        if meter_name == "":
+            raise ValueError("Approved update log row is missing meter_name.")
+
+        if action in {"update", "remove"}:
+            matches = _match_existing_broken_rows(reviewed_broken_df, log_row)
+
+            if len(matches) == 0:
+                raise ValueError(
+                    f"No matching source row found for action '{action}' "
+                    f"on meter '{meter_name}'. Check source_* fields in the "
+                    "update log."
+                )
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Multiple matching source rows found for action "
+                    f"'{action}' on meter '{meter_name}'. Source match must "
+                    "be unique."
+                )
+
+            match_idx = matches.index[0]
+
+            # if action is "remove", drop the matched row from reviewed_broken_df and log the removal
+            if action == "remove":
+                removed_row = reviewed_broken_df.loc[match_idx].copy()
+                reviewed_broken_df = reviewed_broken_df.drop(index=match_idx).reset_index(drop=True)
+
+                applied_change_log.append({
+                    "meter_name": meter_name,
+                    "action": "remove",
+                    "result": "removed source row",
+                    "old_start_date": datetime_to_text(removed_row["start_date"]),
+                    "old_end_date": datetime_to_text(removed_row["end_date"]),
+                    "old_status": removed_row["status"],
+                    "new_start_date": "",
+                    "new_end_date": "",
+                    "new_status": "",
+                })
+                continue
+
+            # if action is "update"
+            old_row = reviewed_broken_df.loc[match_idx].copy()
+            new_start = (
+                parse_strict_datetime_value(
+                    log_row["new_start_date"],
+                    "new_start_date",
+                )
+                if _log_value_is_filled(log_row["new_start_date"])
+                else old_row["start_date"]
+            )
+            new_end = (
+                parse_strict_datetime_value(
+                    log_row["new_end_date"],
+                    "new_end_date",
+                )
+                if _log_value_is_filled(log_row["new_end_date"])
+                else old_row["end_date"]
+            )
+            new_status = (
+                _normalize_text(
+                    log_row["new_status"],
+                    underscore=True,
+                )
+                if _log_value_is_filled(log_row["new_status"])
+                else old_row["status"]
+            )
+            new_desc = (
+                _normalize_text(log_row["new_description"])
+                if _log_value_is_filled(log_row["new_description"])
+                else old_row["description"]
+            )
+
+            if new_status not in BROKEN_STATUS_VALUES:
+                raise ValueError(
+                    f"Invalid new_status for update on meter "
+                    f"'{meter_name}': {new_status}. Allowed: "
+                    f"{sorted(BROKEN_STATUS_VALUES)}"
+                )
+
+            reviewed_broken_df.loc[match_idx, "start_date"] = new_start
+            reviewed_broken_df.loc[match_idx, "end_date"] = new_end
+            reviewed_broken_df.loc[match_idx, "status"] = new_status
+            reviewed_broken_df.loc[match_idx, "description"] = new_desc
+            reviewed_broken_df.loc[match_idx, "updated_data"] = now_ts
+
+            applied_change_log.append({
+                "meter_name": meter_name,
+                "action": "update",
+                "result": "updated source row",
+                "old_start_date": datetime_to_text(old_row["start_date"]),
+                "old_end_date": datetime_to_text(old_row["end_date"]),
+                "old_status": old_row["status"],
+                "new_start_date": datetime_to_text(new_start),
+                "new_end_date": datetime_to_text(new_end),
+                "new_status": new_status,
+            })
+
+        # if action is "add"
+        elif action == "add":
+            new_start = (
+                parse_strict_datetime_value(
+                    log_row["new_start_date"],
+                    "new_start_date",
+                )
+                if _log_value_is_filled(log_row["new_start_date"])
+                else pd.NaT
+            )
+            new_end = (
+                parse_strict_datetime_value(
+                    log_row["new_end_date"],
+                    "new_end_date",
+                )
+                if _log_value_is_filled(log_row["new_end_date"])
+                else pd.NaT
+            )
+            new_status = _normalize_text(
+                log_row["new_status"],
+                underscore=True,
+            )
+            new_desc = _normalize_text(log_row["new_description"])
+
+            if new_status == "":
+                raise ValueError(
+                    f"Action 'add' for meter '{meter_name}' requires "
+                    "new_status."
+                )
+            if new_status not in BROKEN_STATUS_VALUES:
+                raise ValueError(
+                    f"Invalid new_status for add on meter '{meter_name}': "
+                    f"{new_status}. Allowed: "
+                    f"{sorted(BROKEN_STATUS_VALUES)}"
+                )
+
+            duplicate_mask = (
+                reviewed_broken_df["meter_name"].eq(meter_name)
+                & reviewed_broken_df["status"].eq(new_status)
+                & reviewed_broken_df["description"].eq(new_desc)
+                & reviewed_broken_df["start_date"].apply(datetime_to_text).eq(datetime_to_text(new_start))
+                & reviewed_broken_df["end_date"].apply(datetime_to_text).eq(datetime_to_text(new_end))
+            )
+            if duplicate_mask.any():
+                raise ValueError(
+                    f"Action 'add' for meter '{meter_name}' would create "
+                    "a duplicate row."
+                )
+
+            new_row = pd.DataFrame([{
+                "meter_name": meter_name,
+                "start_date": new_start,
+                "end_date": new_end,
+                "status": new_status,
+                "description": new_desc,
+                "data_source": "maintenance_update_log",
+                "updated_data": now_ts,
+            }])
+            reviewed_broken_df = pd.concat([reviewed_broken_df, new_row], ignore_index=True, sort=False)
+
+            applied_change_log.append({
+                "meter_name": meter_name,
+                "action": "add",
+                "result": "added new row",
+                "old_start_date": "",
+                "old_end_date": "",
+                "old_status": "",
+                "new_start_date": datetime_to_text(new_start),
+                "new_end_date": datetime_to_text(new_end),
+                "new_status": new_status,
+            })
+
+    if reviewed_broken_df.empty:
+        reviewed_broken_df = pd.DataFrame(columns=REQUIRED_BROKEN_METER_COLUMNS)
+
+    reviewed_broken_df = reviewed_broken_df[REQUIRED_BROKEN_METER_COLUMNS].copy()
+    reviewed_broken_df = reviewed_broken_df.sort_values(
+        by=["meter_name", "start_date", "end_date", "status"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    applied_change_log_df = pd.DataFrame(applied_change_log)
+
+    if reviewed_copy_file is not None and str(reviewed_copy_file).strip() != "":
+        output_dir = os.path.dirname(str(reviewed_copy_file))
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        reviewed_broken_df.to_csv(
+            reviewed_copy_file,
+            index=False,
+            date_format="%Y-%m-%d %H:%M:%S",
+        )
+        print(
+            f"Reviewed broken meter copy saved to {reviewed_copy_file}"
+        )
+
+    return reviewed_broken_df, applied_change_log_df
 
 
 
