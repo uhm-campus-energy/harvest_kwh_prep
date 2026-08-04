@@ -316,7 +316,7 @@ def apply_special_meter_corrections(data, special_meters_file):
     if data_corrected.empty or len(data_corrected.index) == 0:
         return data_corrected
 
-    bad_periods = pd.read_csv(special_meters_file)
+    bad_periods = pd.read_csv(special_meters_file, low_memory=False)
 
     required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
     missing_cols = required_cols.difference(set(bad_periods.columns))
@@ -422,7 +422,7 @@ def export_removed_special_meter_data(
         print("No special meter file provided. Skipping removed-data export.")
         return pd.DataFrame(columns=export_cols)
 
-    correction_df = pd.read_csv(special_meters_file)
+    correction_df = pd.read_csv(special_meters_file, low_memory=False)
 
     required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
     missing_cols = required_cols.difference(set(correction_df.columns))
@@ -863,7 +863,7 @@ def load_existing_candidates(candidate_file):
     if candidate_file is None or not os.path.exists(candidate_file):
         return pd.DataFrame(columns=cols)
 
-    df = pd.read_csv(candidate_file)
+    df = pd.read_csv(candidate_file, low_memory=False)
 
     if "issue_type/status" in df.columns and "issue_type" not in df.columns:
         df = df.rename(columns={"issue_type/status": "issue_type"})
@@ -3060,7 +3060,7 @@ def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=N
         and str(special_meters_file).strip() != ""
         and os.path.exists(special_meters_file)
     ):
-        bad_periods = pd.read_csv(special_meters_file)
+        bad_periods = pd.read_csv(special_meters_file, low_memory=False)
         required_cols = {"meter_name", "solution", "start_datetime", "end_datetime"}
         if required_cols.issubset(set(bad_periods.columns)):
             bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
