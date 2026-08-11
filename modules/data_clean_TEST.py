@@ -890,6 +890,24 @@ def load_existing_candidates(candidate_file):
 
 
 
+# deletes previously generated candidate review files so this run starts fresh.
+def clear_candidate_files(candidate_file):
+    """
+    Remove the auto-generated candidate review file and its restarts sibling
+    (<candidate_file base>_restarts.csv) so update_special_meter_candidates_workbook
+    regenerates both from scratch on this run.
+    """
+    restart_file = os.path.splitext(candidate_file)[0] + "_restarts.csv"
+
+    for f in (candidate_file, restart_file):
+        if f and os.path.exists(f):
+            os.remove(f)
+            print(f"Cleared previous candidate file: {f}")
+        else:
+            print(f"No existing candidate file to clear: {f}")
+
+
+
 # simple dedupe key builder for merged master/candidate rows.
 def _build_simple_key(df):
     temp = df.copy()
