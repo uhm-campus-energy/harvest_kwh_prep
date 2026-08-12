@@ -2779,8 +2779,19 @@ def compute_meter_differences(
                     partial_sum = 0.0
                     partial_seconds = 0.0
 
-                    # Compute usage and elapsed time for all valid segments
+                    # Compute usage and elapsed time for all valid segments.
+                    # Clamp each segment to [start_time, end_time]: restart
+                    # timestamps come from df_restarts for the meter's full
+                    # history, which can fall outside this call's window
+                    # (e.g. a monthly sub-window) - asof() already clips the
+                    # *values* read to what meter_series actually has, so
+                    # partial_seconds must be clamped the same way or it
+                    # overstates elapsed time relative to partial_sum.
                     for seg_start, seg_end in periods:
+                        seg_start = max(seg_start, start_time)
+                        seg_end = min(seg_end, end_time)
+                        if seg_start >= seg_end:
+                            continue
                         start_val_seg = meter_series.asof(seg_start)
                         end_val_seg = meter_series.asof(seg_end)
                         if pd.notna(start_val_seg) and pd.notna(end_val_seg):
@@ -2893,6 +2904,162 @@ def export_building_differences(export_df, filename, var="kwh"):
     return df_building_sum
 
 
+
+###################################################################
+###################################################################
+
+def get_calendar_month_periods(index, start_time, end_time):
+    """
+    Split [start_time, end_time] into consecutive calendar-month periods,
+    each resolved to timestamps that actually exist in `index` (same
+    resolution rule as resolve_analysis_window).
+
+    The first/last periods are partial when start_time/end_time don't fall
+    on a month boundary. Consecutive periods share their boundary timestamp
+    (period i's end == period i+1's start), so summing raw differences
+    across periods telescopes back to the full-window raw difference.
+
+    Returns a list of (month_label, period_start, period_end) tuples, where
+    month_label is the "YYYY-MM" of the period's start.
+    """
+    start_time = pd.to_datetime(start_time)
+    end_time = pd.to_datetime(end_time)
+
+    month_starts = pd.date_range(start_time.replace(day=1), end_time, freq="MS")
+    boundaries = sorted(set([start_time, end_time]) | set(month_starts))
+    boundaries = [b for b in boundaries if start_time <= b <= end_time]
+
+    periods = []
+    for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+        resolved_start, resolved_end = resolve_analysis_window(index, seg_start, seg_end)
+        if resolved_start == resolved_end:
+            continue
+        label = resolved_start.strftime("%Y-%m")
+        periods.append((label, resolved_start, resolved_end))
+
+    return periods
+
+
+###################################################################
+###################################################################
+
+def compute_monthly_meter_differences(
+    data,
+    start_time,
+    end_time,
+    df_bad_meters,
+    df_restarts,
+    monthly_min_valid_fraction=0.5,
+    r2_threshold=0.9,
+    restarts_thres=5,
+):
+    """
+    Run compute_meter_differences separately for each calendar month within
+    [start_time, end_time].
+
+    The annual calculation uses a fixed valid_len (e.g. 5 months of data)
+    to decide whether a missing edge (R²=-1) meter is scaled. That threshold
+    doesn't make sense at monthly resolution, so here valid_len is derived
+    per-month as monthly_min_valid_fraction * (that month's interval count).
+
+    Returns a long format DataFrame with one row per (meter_name, month).
+    """
+    periods = get_calendar_month_periods(data.index, start_time, end_time)
+
+    monthly_results = []
+    for label, period_start, period_end in periods:
+        # compute_meter_differences' R²=-1/-2 branches operate on the full
+        # `data` passed in (not clipped to start_time/end_time), so each
+        # month must be sliced here before calling it - otherwise those
+        # branches would pull first/last values from the whole analysis
+        # window instead of from just this month.
+        period_data = data.loc[period_start:period_end]
+
+        n_intervals = period_data.index.get_loc(period_end) - period_data.index.get_loc(period_start)
+        month_valid_len = max(1, round(n_intervals * monthly_min_valid_fraction))
+
+        month_df = compute_meter_differences(
+            period_data,
+            period_start,
+            period_end,
+            df_bad_meters,
+            df_restarts,
+            valid_len=month_valid_len,
+            r2_threshold=r2_threshold,
+            restarts_thres=restarts_thres,
+        )
+        month_df = month_df.reset_index()
+        month_df.insert(1, "month", label)
+        monthly_results.append(month_df)
+
+    return pd.concat(monthly_results, ignore_index=True)
+
+
+###################################################################
+###################################################################
+
+def export_monthly_meter_differences(monthly_df, meter_info_file, filename, var="kwh"):
+    """
+    Pivot long-format monthly meter differences (from
+    compute_monthly_meter_differences) to one row per meter and one column
+    per month, and save to CSV.
+
+    Returns the long-format DataFrame merged with building info (one row
+    per meter per month), for use in downstream checks/aggregation.
+    """
+    export_df = monthly_df.copy()
+
+    meter_info = pd.read_csv(meter_info_file)[['meter_name', 'building_complex_name']]
+    meter_info.columns = meter_info.columns.str.strip()
+    export_df = export_df.merge(meter_info, on='meter_name', how='left')
+
+    pivot_df = export_df.pivot(index='meter_name', columns='month', values='difference')
+    pivot_df = pivot_df.round(1)
+    pivot_df = pivot_df.add_prefix(f"{var}_")
+    pivot_df = pivot_df.reset_index()
+
+    pivot_df.to_csv(filename, index=False)
+
+    return export_df
+
+
+###################################################################
+###################################################################
+
+def export_annual_vs_monthly_check(df_annual, df_monthly_long, filename, var="kwh"):
+    """
+    Compare each meter's annual difference to the sum of its monthly
+    differences and save a review CSV.
+
+    - df_annual: long format meter-level DataFrame from
+      export_meter_differences (has 'meter_name' and 'difference')
+    - df_monthly_long: long format DataFrame from
+      export_monthly_meter_differences (has 'meter_name', 'month',
+      'difference')
+
+    Differences between the two are expected when a special meter is
+    scaled differently within individual monthly periods vs. over the
+    full analysis window; this is a review check, not a replacement for
+    the annual calculation.
+    """
+    annual = df_annual[['meter_name', 'difference']].rename(
+        columns={'difference': f'annual_{var}'}
+    )
+
+    monthly_sum = df_monthly_long.groupby('meter_name', as_index=False).agg(
+        **{f'sum_monthly_{var}': ('difference', lambda x: x.sum(min_count=1))}
+    )
+
+    check_df = annual.merge(monthly_sum, on='meter_name', how='outer')
+    check_df[f'difference_{var}'] = (
+        check_df[f'annual_{var}'] - check_df[f'sum_monthly_{var}']
+    ).round(1)
+    check_df[f'annual_{var}'] = check_df[f'annual_{var}'].round(1)
+    check_df[f'sum_monthly_{var}'] = check_df[f'sum_monthly_{var}'].round(1)
+
+    check_df.to_csv(filename, index=False)
+
+    return check_df
 
 
 ###################################################################
