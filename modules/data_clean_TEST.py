@@ -3044,6 +3044,24 @@ def export_monthly_meter_differences(monthly_df, meter_info_file, filename, var=
 ###################################################################
 ###################################################################
 
+def export_monthly_scaling_detail(monthly_df, filename):
+    """
+    Pivot long-format monthly meter differences (from
+    compute_monthly_meter_differences) to one row per meter and one column
+    per month, with each cell holding that meter's "% scaled" value for
+    the month (e.g. "45%", "", or "N/A").
+    """
+    pivot_df = monthly_df.pivot(index='meter_name', columns='month', values='% scaled')
+    pivot_df = pivot_df.rename_axis(columns=None).reset_index()
+
+    pivot_df.to_csv(filename, index=False)
+
+    return pivot_df
+
+
+###################################################################
+###################################################################
+
 def export_annual_vs_monthly_check(df_annual, df_monthly_long, filename, var="kwh"):
     """
     Compare each meter's annual difference to the sum of its monthly
