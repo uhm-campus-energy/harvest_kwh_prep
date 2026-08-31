@@ -3033,7 +3033,7 @@ def export_monthly_meter_differences(monthly_df, meter_info_file, filename, var=
 
     pivot_df = export_df.pivot(index='meter_name', columns='month', values='difference')
     pivot_df = pivot_df.round(1)
-    pivot_df = pivot_df.add_prefix(f"{var}_")
+    # pivot_df = pivot_df.add_prefix(f"{var}_")
     pivot_df = pivot_df.reset_index()
 
     pivot_df.to_csv(filename, index=False)
