@@ -2853,7 +2853,7 @@ def compute_meter_differences(
         elif row["% scaled"] == 0:
             return ""
         else:
-            return f"{int(row['% scaled'])}%"
+            return f"{row['% scaled']:.1f}%"
 
     result_df["% scaled"] = result_df.apply(format_percent, axis=1)
 
