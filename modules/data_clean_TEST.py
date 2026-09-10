@@ -2886,6 +2886,8 @@ def export_meter_differences(df, meter_info_file, filename, var="kwh"):
     
     # Save to CSV
     df_csv.to_csv(filename, index=False)
+
+    print(f"Meter scaling detail saved to {filename}")
     
     return export_df
 
@@ -2919,6 +2921,7 @@ def export_building_differences(export_df, filename, var="kwh"):
     # Save to CSV
     df_building_sum.to_csv(filename, index=False)
 
+    print(f"Building annual kwh file saved to {filename}")
     return df_building_sum
 
 
@@ -3094,6 +3097,8 @@ def export_annual_vs_monthly_check(df_annual, df_monthly_long, filename, var="kw
     check_df[f'sum_monthly_{var}'] = check_df[f'sum_monthly_{var}'].round(1)
 
     check_df.to_csv(filename, index=False)
+
+    print(f"Annual vs monthly file saved to {filename}")
 
     return check_df
 
