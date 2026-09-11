@@ -2873,7 +2873,7 @@ def export_meter_differences(df, meter_info_file, filename, var="kwh"):
     export_df = df.copy().reset_index()
     
     # Merge building info
-    meter_info = pd.read_csv(meter_info_file)[['meter_name', 'building_complex_name']]
+    meter_info = pd.read_csv(meter_info_file)[['meter_name', 'building_complex_name', 'end_use']]
     meter_info.columns = meter_info.columns.str.strip()
     export_df = export_df.merge(meter_info, on='meter_name', how='left')
     
@@ -2887,7 +2887,7 @@ def export_meter_differences(df, meter_info_file, filename, var="kwh"):
     # Save to CSV
     df_csv.to_csv(filename, index=False)
 
-    print(f"Meter scaling detail saved to {filename}")
+    print(f"Annual {var} saved to {filename}")
     
     return export_df
 
@@ -2897,21 +2897,25 @@ def export_meter_differences(df, meter_info_file, filename, var="kwh"):
 
 def export_building_differences(export_df, filename, var="kwh"):
     """
-    Aggregate meter differences per building and save to CSV.
-    - export_df: full meter-level DataFrame (from export_meter_differences)
+    Aggregate main-meter differences per building and save to CSV.
+    - export_df: full meter-level DataFrame (from export_meter_differences), must include 'end_use'
     - filename: output CSV path
     - var: variable name for annual consumption (e.g., 'kwh')
-    
+
+    Only meters with end_use == 'main' are summed; submeters are excluded so
+    their usage isn't double-counted alongside their building's main meter.
+
     The CSV contains:
-        building_complex_name, annual_<var>, num_meters
+        building_complex_name, annual_<var>, num_main_meters
     """
-    # Keep only building_complex_name and difference
-    df_building = export_df[['building_complex_name', 'difference']].copy()
+    # Keep only main meters, then building_complex_name and difference
+    main_only = export_df[export_df['end_use'] == 'main']
+    df_building = main_only[['building_complex_name', 'difference']].copy()
 
     # Aggregate sum per building, keep NaN if all are NaN
     df_building_sum = df_building.groupby('building_complex_name', as_index=False).agg(
         difference=('difference', lambda x: x.sum(min_count=1)),  # sum, NaN if all NaN
-        num_meters=('difference', 'count')  # count of non-NaN meters
+        num_main_meters=('difference', 'count')  # count of non-NaN main meters
     )
 
     # Rename column to annual_<var> and round to 1 decimal
@@ -3041,6 +3045,8 @@ def export_monthly_meter_differences(monthly_df, meter_info_file, filename, var=
 
     pivot_df.to_csv(filename, index=False)
 
+    print(f"Monthly {var} file saved to {filename}")
+
     return export_df
 
 
@@ -3058,6 +3064,8 @@ def export_monthly_scaling_detail(monthly_df, filename):
     pivot_df = pivot_df.rename_axis(columns=None).reset_index()
 
     pivot_df.to_csv(filename, index=False)
+
+    print(f"Monthly % scaled wide format file saved to {filename}")
 
     return pivot_df
 
