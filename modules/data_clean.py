@@ -2638,232 +2638,6 @@ def apply_broken_meter_update_actions(
 ###################################################################
 
 
-def compute_meter_differences(
-    data,
-    start_time,
-    end_time,
-    df_bad_meters,
-    df_restarts,
-    valid_len=5*30*96,
-    r2_threshold=0.9,
-    restarts_thres=5,
-):
-    """
-    Compute start/end values, raw difference, scaled difference, R² info, and % scaled for meters.
-    Returns a DataFrame indexed by meter_name.
-
-    Assumptions:
-        - data has a DatetimeIndex.
-        - 0→NaN replacements (if needed) are applied before calling this function.
-        - df_bad_meters has columns: meter_name, r2, info.
-        - df_restarts has columns: meter_name, previous_valid_time, restart_time.
-    """
-
-    results = []
-
-    # Map each meter_name to its (numeric r2, info text, original r2 value)
-    bad_dict = {}
-    if df_bad_meters is not None and not df_bad_meters.empty:
-        for row in df_bad_meters.itertuples(index=False):
-            meter = row.meter_name
-            r2_orig = row.r2
-            info = row.info
-            try:
-                r2_num = float(r2_orig)
-            except Exception:
-                r2_num = np.nan
-            bad_dict[meter] = (r2_num, info, r2_orig)
-
-    start_time = pd.to_datetime(start_time)
-    end_time = pd.to_datetime(end_time)
-
-    # Interval count based on index positions (used for most scaling logic)
-    start_idx = data.index.get_loc(start_time)
-    end_idx = data.index.get_loc(end_time)
-    total_fy_intervals = end_idx - start_idx
-
-    # Total duration of the analysis window in seconds (used for restart meters)
-    fy_seconds = (end_time - start_time).total_seconds()
-
-    for meter_name in data.columns:
-        series = data[meter_name]
-
-        # Default values for output fields
-        start_val = end_val = raw_diff = scaled_diff = np.nan
-        st_time = en_time = pd.NaT
-        r2_val = np.nan
-        info_val = ""
-        percent_scaled = np.nan
-
-        if meter_name not in bad_dict:
-            # Meters not flagged as "bad": direct start/end difference if both endpoints exist
-            if start_time in series.index and end_time in series.index:
-                start_val = series.loc[start_time]
-                end_val = series.loc[end_time]
-                raw_diff = scaled_diff = end_val - start_val
-                st_time, en_time = start_time, end_time
-                percent_scaled = 0
-            r2_val, info_val = f">= {r2_threshold}", ""
-
-        else:
-            r2_num, info, r2_orig = bad_dict[meter_name]
-            r2_val = r2_orig
-            info_val = info
-
-            if np.isnan(r2_num):
-                # r2 value could not be interpreted numerically
-                pass
-
-            elif r2_num == 0:
-                # All values are NaN
-                pass
-
-            elif r2_num == -1:
-                # Missing start or end: use first and last non-repeated values
-                y = series.where(series.ne(series.shift()))
-                first_valid = y.first_valid_index()
-                last_valid = y.last_valid_index()
-                if first_valid is not None and last_valid is not None:
-                    first_val = y.loc[first_valid]
-                    last_val = y.loc[last_valid]
-                    raw_diff = last_val - first_val
-                    n_intervals = y.index.get_loc(last_valid) - y.index.get_loc(first_valid)
-                    if n_intervals >= valid_len:
-                        scaled_diff = raw_diff / n_intervals * total_fy_intervals
-                        percent_scaled = (total_fy_intervals - n_intervals) / total_fy_intervals * 100
-                    start_val, end_val = first_val, last_val
-                    st_time, en_time = first_valid, last_valid
-
-            elif r2_num == -2:
-                # Stuck at start or end: remove stuck region, then use first/last remaining values
-                y = series.copy()
-                tokens = str(info).split()
-                stuck_len = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
-
-                if stuck_len > 1:
-                    if "start" in info:
-                        y.iloc[:stuck_len] = np.nan
-                    elif "end" in info:
-                        y.iloc[-stuck_len:] = np.nan
-
-                valid = y.dropna()
-                if len(valid) >= 2:
-                    first_idx, last_idx = valid.index[0], valid.index[-1]
-                    first_val, last_val = valid.iloc[0], valid.iloc[-1]
-                    raw_diff = last_val - first_val
-                    n_intervals = y.index.get_loc(last_idx) - y.index.get_loc(first_idx)
-                    scaled_diff = raw_diff / n_intervals * total_fy_intervals
-                    percent_scaled = (total_fy_intervals - n_intervals) / total_fy_intervals * 100
-                    start_val, end_val = first_val, last_val
-                    st_time, en_time = first_idx, last_idx
-
-            elif r2_num == -3:
-                # Meters with restart events (cumulative value drops during the year)
-                meter_restarts = df_restarts[df_restarts["meter_name"] == meter_name]
-                restart_count = len(meter_restarts)
-
-                # If the number of restarts is above the threshold, skip usage reconstruction
-                if restart_count > restarts_thres:
-                    raw_diff = scaled_diff = percent_scaled = np.nan
-
-                else:
-                    # Sort restart events in chronological order
-                    meter_restarts = meter_restarts.sort_values("restart_time")
-
-                    # Remove consecutive duplicate readings (keeps only the first in each run)
-                    clean_series = series.mask(series.eq(series.shift()))
-
-                    # Restrict data to the analysis window [start_time, end_time]
-                    meter_series = clean_series.loc[start_time:end_time]
-
-                    # Build segments between restart events where cumulative reading increases normally
-                    periods = []
-                    prev_time = start_time
-
-                    for _, r in meter_restarts.iterrows():
-                        prev_valid = r["previous_valid_time"]
-                        restart_t = r["restart_time"]
-
-                        # Segment from previous segment start to last valid reading before restart
-                        if prev_time < prev_valid:
-                            periods.append((prev_time, prev_valid))
-
-                        prev_time = restart_t
-
-                    # Final segment from last restart to the end of the analysis window
-                    if prev_time < end_time:
-                        periods.append((prev_time, end_time))
-
-                    partial_sum = 0.0
-                    partial_seconds = 0.0
-
-                    # Compute usage and elapsed time for all valid segments.
-                    # Clamp each segment to [start_time, end_time]: restart
-                    # timestamps come from df_restarts for the meter's full
-                    # history, which can fall outside this call's window
-                    # (e.g. a monthly sub-window) - asof() already clips the
-                    # *values* read to what meter_series actually has, so
-                    # partial_seconds must be clamped the same way or it
-                    # overstates elapsed time relative to partial_sum.
-                    for seg_start, seg_end in periods:
-                        seg_start = max(seg_start, start_time)
-                        seg_end = min(seg_end, end_time)
-                        if seg_start >= seg_end:
-                            continue
-                        start_val_seg = meter_series.asof(seg_start)
-                        end_val_seg = meter_series.asof(seg_end)
-                        if pd.notna(start_val_seg) and pd.notna(end_val_seg):
-                            partial_sum += (end_val_seg - start_val_seg)
-                            partial_seconds += (seg_end - seg_start).total_seconds()
-
-                    # Scale partial usage to the full analysis window based on time coverage
-                    if partial_seconds > 0 and fy_seconds > 0:
-                        scaled_diff = partial_sum * (fy_seconds / partial_seconds)
-                        percent_scaled = (fy_seconds - partial_seconds) / fy_seconds * 100
-
-                    raw_diff = partial_sum
-
-            elif r2_num == -4 or r2_num > 0:
-                # Too few points, or positive R² but treated as bad without a correction rule
-                raw_diff = scaled_diff = percent_scaled = np.nan
-
-        results.append((
-            meter_name,
-            st_time, start_val,
-            en_time, end_val,
-            raw_diff, scaled_diff,
-            r2_val, info_val,
-            percent_scaled
-        ))
-
-    result_df = pd.DataFrame(
-        results,
-        columns=[
-            "meter_name", "start_time", "start",
-            "end_time", "end",
-            "raw_difference", "difference",
-            "R²", "info",
-            "% scaled"
-        ]
-    ).set_index("meter_name")
-
-    def format_percent(row):
-        if pd.isna(row["% scaled"]):
-            return "N/A" if row["info"] != "" else ""
-        elif row["% scaled"] == 0:
-            return ""
-        else:
-            return f"{row['% scaled']:.1f}%"
-
-    result_df["% scaled"] = result_df.apply(format_percent, axis=1)
-
-    return result_df
-
-
-
-###################################################################
-###################################################################
-
 def export_meter_differences(df, meter_info_file, filename, var="kwh"):
     """
     Prepare export_df with all columns, but when saving to CSV, only output meter_name and difference.
@@ -2968,6 +2742,288 @@ def get_calendar_month_periods(index, start_time, end_time):
 ###################################################################
 ###################################################################
 
+#
+# Interpolation-first differences (scale only when have to)
+#
+# Each meter's cumulative reading is linearly interpolated (in time) at any
+# window boundary that falls inside a data gap, so gaps *between* valid
+# readings never need scaling. Scaling is used only for time that no valid
+# reading brackets: missing/stuck data at the very start or end of the
+# analysis window, and the gap across a meter restart.
+#
+# Because annual and monthly use the same interpolated readings, a meter's
+# monthly values add up to its annual value whenever no scaling is needed.
+
+def _seconds_since(index, ref):
+    """Convert a DatetimeIndex to float seconds since ref (resolution-safe)."""
+    return np.asarray((index - ref) / pd.Timedelta(seconds=1), dtype=float)
+
+
+def _meter_interp_segments(series, ref, r2_num, info, meter_restarts):
+    """
+    Split one meter's valid readings into continuous counter segments.
+
+    - Stuck edge runs (R²=-2) are removed first, using the stuck length
+      in info (e.g. "stuck 120 pts at start").
+    - Restart meters (R²=-3) are cut at each restart: one segment ends at
+      previous_valid_time and the next starts at restart_time, because the
+      counter can't be interpolated across a reset.
+
+    Returns a list of (times_s, values) numpy arrays, each with >= 2 readings.
+    """
+    y = series.copy()
+
+    if r2_num == -2:
+        tokens = str(info).split()
+        stuck_len = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
+        if stuck_len > 1:
+            if "start" in info:
+                y.iloc[:stuck_len] = np.nan
+            elif "end" in info:
+                y.iloc[-stuck_len:] = np.nan
+
+    y = y.dropna()
+    if len(y) < 2:
+        return []
+
+    t = _seconds_since(y.index, ref)
+    v = y.to_numpy(dtype=float)
+
+    # Segment bounds (in seconds); a single open-ended segment unless restarts
+    bounds = []
+    lo = -np.inf
+    if meter_restarts is not None and not meter_restarts.empty:
+        for r in meter_restarts.sort_values("restart_time").itertuples(index=False):
+            prev_valid = (pd.to_datetime(r.previous_valid_time) - ref) / pd.Timedelta(seconds=1)
+            restart_t = (pd.to_datetime(r.restart_time) - ref) / pd.Timedelta(seconds=1)
+            bounds.append((lo, prev_valid))
+            lo = restart_t
+    bounds.append((lo, np.inf))
+
+    segments = []
+    for seg_lo, seg_hi in bounds:
+        mask = (t >= seg_lo) & (t <= seg_hi)
+        if mask.sum() >= 2:
+            segments.append((t[mask], v[mask]))
+    return segments
+
+
+def _interp_usage_over_window(segments, a, b, max_step):
+    """
+    Measured + interpolated usage over [a, b] (seconds) from interp segments.
+
+    Returns a dict with:
+        usage        : kWh from interpolated readings (no scaling)
+        covered_s    : seconds of [a, b] bracketed by valid readings
+        interp_s     : seconds of [a, b] that fall inside interior data gaps
+        interp_kwh   : share of `usage` that comes from those gaps
+        first, last  : (seconds, reading) at the first/last covered point
+    """
+    usage = covered_s = interp_s = interp_kwh = 0.0
+    first = last = None
+
+    for t, v in segments:
+        lo, hi = max(a, t[0]), min(b, t[-1])
+        if lo >= hi:
+            continue
+
+        v_lo, v_hi = np.interp([lo, hi], t, v)
+        usage += v_hi - v_lo
+        covered_s += hi - lo
+
+        # Interior gaps: consecutive valid readings more than one interval apart
+        dt = np.diff(t)
+        gap = dt > max_step
+        if gap.any():
+            g_lo = np.maximum(t[:-1][gap], lo)
+            g_hi = np.minimum(t[1:][gap], hi)
+            overlap = np.clip(g_hi - g_lo, 0, None)
+            interp_s += overlap.sum()
+            interp_kwh += (np.diff(v)[gap] * overlap / dt[gap]).sum()
+
+        if first is None:
+            first = (lo, v_lo)
+        last = (hi, v_hi)
+
+    return {
+        "usage": usage, "covered_s": covered_s,
+        "interp_s": interp_s, "interp_kwh": interp_kwh,
+        "first": first, "last": last,
+    }
+
+
+def _compute_interp_window_differences(
+    data,
+    windows,
+    df_bad_meters,
+    df_restarts,
+    min_covered_fn,
+    r2_threshold=0.9,
+    restarts_thres=5,
+):
+    """
+    Shared engine for compute_meter_differences and
+    compute_monthly_meter_differences.
+
+    windows: list of (label, window_start, window_end) timestamps.
+    min_covered_fn: window length (s) -> minimum covered seconds required
+        before a partly-covered window is scaled up.
+
+    Segments are built once from the full `data` (not per window), so a
+    boundary inside a gap is interpolated using the valid readings on either
+    side of it, even when those readings fall in a neighbouring month.
+    """
+    bad_dict = {}
+    if df_bad_meters is not None and not df_bad_meters.empty:
+        for row in df_bad_meters.itertuples(index=False):
+            try:
+                r2_num = float(row.r2)
+            except Exception:
+                r2_num = np.nan
+            bad_dict[row.meter_name] = (r2_num, row.info, row.r2)
+
+    ref = data.index[0]
+    max_step = 1.5 * np.median(np.diff(_seconds_since(data.index, ref)))
+
+    win_s = [
+        (label,
+         (pd.to_datetime(ws) - ref) / pd.Timedelta(seconds=1),
+         (pd.to_datetime(we) - ref) / pd.Timedelta(seconds=1))
+        for label, ws, we in windows
+    ]
+
+    results = []
+    for meter_name in data.columns:
+        series = data[meter_name]
+
+        if meter_name in bad_dict:
+            r2_num, info_val, r2_val = bad_dict[meter_name]
+        else:
+            r2_num, info_val, r2_val = np.nan, "", f">= {r2_threshold}"
+
+        meter_restarts = None
+        if df_restarts is not None and not df_restarts.empty:
+            meter_restarts = df_restarts[df_restarts["meter_name"] == meter_name]
+
+        # Excluded (left NaN): unreadable R², all NaN, too few points,
+        # low R² with no correction rule, too many restarts
+        usable = meter_name not in bad_dict or (
+            not np.isnan(r2_num)
+            and r2_num in (-1, -2, -3)
+            and not (r2_num == -3 and len(meter_restarts) > restarts_thres)
+        )
+
+        segments = (
+            _meter_interp_segments(series, ref, r2_num, info_val, meter_restarts)
+            if usable else []
+        )
+
+        for label, a, b in win_s:
+            st_time = en_time = pd.NaT
+            start_val = end_val = np.nan
+            raw_diff = scaled_diff = interp_kwh = np.nan
+            pct_interp = pct_scaled = np.nan
+
+            if usable:
+                u = _interp_usage_over_window(segments, a, b, max_step)
+                window_s = b - a
+
+                if u["covered_s"] > 0:
+                    raw_diff = u["usage"]
+                    interp_kwh = u["interp_kwh"]
+                    pct_interp = u["interp_s"] / window_s * 100
+                    st_time = ref + pd.Timedelta(seconds=u["first"][0])
+                    en_time = ref + pd.Timedelta(seconds=u["last"][0])
+                    start_val, end_val = u["first"][1], u["last"][1]
+
+                    missing_s = window_s - u["covered_s"]
+                    if missing_s <= 0:
+                        # Fully bracketed by valid readings: no scaling
+                        scaled_diff = raw_diff
+                        pct_scaled = 0
+                    elif u["covered_s"] >= min_covered_fn(window_s):
+                        # Scale only the time no reading brackets
+                        scaled_diff = raw_diff * window_s / u["covered_s"]
+                        pct_scaled = missing_s / window_s * 100
+
+            results.append((
+                meter_name, label,
+                st_time, start_val,
+                en_time, end_val,
+                raw_diff, scaled_diff, interp_kwh,
+                r2_val, info_val,
+                pct_interp, pct_scaled,
+            ))
+
+    result_df = pd.DataFrame(
+        results,
+        columns=[
+            "meter_name", "month",
+            "start_time", "start",
+            "end_time", "end",
+            "raw_difference", "difference", "interpolated_kwh",
+            "R²", "info",
+            "% interpolated", "% scaled",
+        ],
+    )
+
+    def format_percent(value, info):
+        if pd.isna(value):
+            return "N/A" if info != "" else ""
+        elif value == 0:
+            return ""
+        else:
+            return f"{value:.1f}%"
+
+    for col in ["% interpolated", "% scaled"]:
+        result_df[col] = [
+            format_percent(val, info)
+            for val, info in zip(result_df[col], result_df["info"])
+        ]
+
+    return result_df
+
+
+def compute_meter_differences(
+    data,
+    start_time,
+    end_time,
+    df_bad_meters,
+    df_restarts,
+    valid_len=5*30*96,
+    r2_threshold=0.9,
+    restarts_thres=5,
+):
+    """
+    Annual (start_time -> end_time) kWh difference per meter, interpolating
+    across data gaps and scaling only when the window edges (or a restart
+    gap) aren't bracketed by valid readings.
+
+    Scaling requires at least valid_len intervals of covered time; meters
+    with less coverage are left NaN ("N/A").
+
+    raw_difference = measured + interpolated (unscaled);
+    difference - raw_difference = the scaled (extrapolated) kWh.
+    Returns a DataFrame indexed by meter_name.
+    """
+    start_time = pd.to_datetime(start_time)
+    end_time = pd.to_datetime(end_time)
+
+    step_s = np.median(np.diff(_seconds_since(data.index, data.index[0])))
+    min_covered_s = valid_len * step_s
+
+    result_df = _compute_interp_window_differences(
+        data,
+        [("annual", start_time, end_time)],
+        df_bad_meters,
+        df_restarts,
+        min_covered_fn=lambda window_s: min_covered_s,
+        r2_threshold=r2_threshold,
+        restarts_thres=restarts_thres,
+    )
+    return result_df.drop(columns="month").set_index("meter_name")
+
+
 def compute_monthly_meter_differences(
     data,
     start_time,
@@ -2979,45 +3035,27 @@ def compute_monthly_meter_differences(
     restarts_thres=5,
 ):
     """
-    Run compute_meter_differences separately for each calendar month within
-    [start_time, end_time].
+    Calendar month kWh difference per meter, using the same interpolated
+    readings as compute_meter_differences, so month boundaries that
+    fall in a gap are interpolated instead of left blank or scaled.
 
-    The annual calculation uses a fixed valid_len (e.g. 5 months of data)
-    to decide whether a missing edge (R²=-1) meter is scaled. That threshold
-    doesn't make sense at monthly resolution, so here valid_len is derived
-    per-month as monthly_min_valid_fraction * (that month's interval count).
+    A month is scaled only for time not bracketed by valid readings, and only
+    if at least monthly_min_valid_fraction of the month is covered; months
+    with less coverage are left NaN ("N/A").
 
     Returns a long format DataFrame with one row per (meter_name, month).
     """
     periods = get_calendar_month_periods(data.index, start_time, end_time)
 
-    monthly_results = []
-    for label, period_start, period_end in periods:
-        # compute_meter_differences' R²=-1/-2 branches operate on the full
-        # `data` passed in (not clipped to start_time/end_time), so each
-        # month must be sliced here before calling it - otherwise those
-        # branches would pull first/last values from the whole analysis
-        # window instead of from just this month.
-        period_data = data.loc[period_start:period_end]
-
-        n_intervals = period_data.index.get_loc(period_end) - period_data.index.get_loc(period_start)
-        month_valid_len = max(1, round(n_intervals * monthly_min_valid_fraction))
-
-        month_df = compute_meter_differences(
-            period_data,
-            period_start,
-            period_end,
-            df_bad_meters,
-            df_restarts,
-            valid_len=month_valid_len,
-            r2_threshold=r2_threshold,
-            restarts_thres=restarts_thres,
-        )
-        month_df = month_df.reset_index()
-        month_df.insert(1, "month", label)
-        monthly_results.append(month_df)
-
-    return pd.concat(monthly_results, ignore_index=True)
+    return _compute_interp_window_differences(
+        data,
+        periods,
+        df_bad_meters,
+        df_restarts,
+        min_covered_fn=lambda window_s: monthly_min_valid_fraction * window_s,
+        r2_threshold=r2_threshold,
+        restarts_thres=restarts_thres,
+    )
 
 
 ###################################################################
