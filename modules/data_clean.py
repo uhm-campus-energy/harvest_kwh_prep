@@ -1218,6 +1218,8 @@ def update_special_meter_candidates_workbook(
     - do not create blue missing rows for meters broken across the full window
     - stuck_run rows skip review: if meter_corrections_file is given they are written
       straight to the master sheet with solution stuck_solution, and left out of the candidate file
+    - rows overlapping an open-ended broken-meter row get suggestion "review_remove_broken"
+      (approve with solution remove_broken if the meter is not actually broken)
     """
     window_start = pd.to_datetime(window_start)
     window_end = pd.to_datetime(window_end)
