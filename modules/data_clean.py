@@ -16,8 +16,9 @@ from matplotlib.patches import Patch
 
 
 # 'broken' is treated like a removal style correction
-ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
-# {"broken", "fixed_meter", "remove_broken", "remove", "div100", "no_interp"}
+# 'remove_broken' deletes the meter's open-ended row from the running broken list
+# (date edits to broken rows are done in the maintenance notebook instead)
+ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove_broken", "remove", "div100", "no_interp"}
 BROKEN_STATUS_VALUES = {"broken", "repaired", "under_renovation", "no_meter"}
 
 ###################################################################
@@ -983,6 +984,75 @@ def add_candidates_to_broken_list(broken_candidates, broken_meters_file, data_so
 
 
 
+# deletes the open-ended broken row each approved "remove_broken" candidate overlaps
+def remove_candidates_from_broken_list(remove_candidates, broken_meters_file):
+    """
+    For each candidate, find the meter's broken-list row with a blank end_date that
+    overlaps the candidate window and delete it. Every candidate must match exactly
+    one open row, otherwise nothing is written and an error is raised (approved rows
+    leave the candidate file next run, so a skipped one would be lost). Rows with an
+    end date are never touched here; edit those in the maintenance notebook.
+
+    A timestamped backup of the broken list is saved next to it before overwriting.
+    """
+    if not os.path.exists(broken_meters_file):
+        raise ValueError(f"Broken meter file not found: {broken_meters_file}")
+
+    # raw text keeps the file's own formatting when written back
+    broken_raw = pd.read_csv(broken_meters_file, dtype=str, keep_default_na=False)
+    broken_raw.columns = [str(col).strip().lower().replace(" ", "_") for col in broken_raw.columns]
+    meter_names = broken_raw["meter_name"].apply(_normalize_text)
+    statuses = broken_raw["status"].apply(lambda x: _normalize_text(x, underscore=True))
+    starts = _parse_strict_date_series(broken_raw["start_date"], "start_date")
+    ends = _parse_strict_date_series(broken_raw["end_date"], "end_date")
+
+    drop_idx = set()
+    errors = []
+    for _, row in remove_candidates.iterrows():
+        meter = _normalize_text(row["meter_name"])
+        cand_start = pd.to_datetime(row["start_datetime"], errors="coerce")
+        cand_end = pd.to_datetime(row["end_datetime"], errors="coerce")
+
+        # blank candidate dates count as open, so they overlap anything on that side
+        overlaps = (
+            meter_names.eq(meter)
+            & statuses.isin(BROKEN_STATUS_VALUES)
+            & (starts.isna() | pd.isna(cand_end) | (starts <= cand_end))
+            & (ends.isna() | pd.isna(cand_start) | (ends >= cand_start))
+        )
+        open_matches = broken_raw.index[overlaps & ends.isna()]
+
+        if len(open_matches) == 1:
+            drop_idx.add(open_matches[0])
+        elif len(open_matches) > 1:
+            errors.append(f"{meter}: more than one open-ended broken row overlaps the candidate window")
+        elif overlaps.any():
+            errors.append(
+                f"{meter}: the overlapping broken row has an end date; "
+                "edit or remove it in the maintenance notebook instead"
+            )
+        else:
+            errors.append(f"{meter}: no open-ended broken row overlaps the candidate window")
+
+    if errors:
+        raise ValueError(
+            "Could not apply remove_broken candidates (nothing was changed):\n- "
+            + "\n- ".join(errors)
+        )
+
+    if drop_idx:
+        stamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = os.path.splitext(broken_meters_file)[0] + f"_backup_{stamp}.csv"
+        broken_raw_original = pd.read_csv(broken_meters_file, dtype=str, keep_default_na=False)
+        broken_raw_original.to_csv(backup_file, index=False)
+        print(f"Broken meter list backed up to {backup_file}")
+
+        broken_raw_original.drop(index=sorted(drop_idx)).to_csv(broken_meters_file, index=False)
+
+    print(f"{len(drop_idx)} open-ended broken row(s) removed from {broken_meters_file}")
+
+
+
 # master sheet sync for official corrections, approved candidates, and broken-meter rows.
 def sync_meter_corrections_master_sheet(
     candidate_file,
@@ -999,7 +1069,8 @@ def sync_meter_corrections_master_sheet(
     - existing master rows that did not come from the broken list
       (approved candidates from earlier runs, stuck_run rows, hand-added rows)
     - approved candidate rows (approved == 1 and solution filled in); rows with
-      solution "broken" are added to the running broken meter file instead (with data_source)
+      solution "broken" are added to the running broken meter file instead (with data_source),
+      and rows with solution "remove_broken" delete the overlapping open-ended row from it
     - every row from the running broken meter file
     """
     master_cols = [
@@ -1036,6 +1107,12 @@ def sync_meter_corrections_master_sheet(
     if is_broken.any():
         add_candidates_to_broken_list(approved_candidates[is_broken], broken_meters_file, data_source)
     approved_candidates = approved_candidates[~is_broken]
+
+    # approved "remove_broken" candidates delete their open-ended row from the running list
+    is_remove_broken = approved_candidates["solution"].eq("remove_broken")
+    if is_remove_broken.any():
+        remove_candidates_from_broken_list(approved_candidates[is_remove_broken], broken_meters_file)
+    approved_candidates = approved_candidates[~is_remove_broken]
 
     broken_df = load_broken_meter_workbook(broken_meters_file)
 
@@ -1456,6 +1533,18 @@ def update_special_meter_candidates_workbook(
         if meter_corrections_file is not None and not stuck_rows.empty:
             stuck_rows["solution"] = stuck_solution
             add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file)
+
+        # rows overlapping an open-ended broken row (purple on the review PDF) may mean
+        # the meter is not actually broken: flag them for the remove_broken solution
+        open_broken = broken_df[broken_df["end_date"].isna()]
+        for idx, row in combined_candidates.iterrows():
+            cand_start = pd.to_datetime(row["start_datetime"], errors="coerce")
+            cand_end = pd.to_datetime(row["end_datetime"], errors="coerce")
+            if pd.isna(cand_start) or pd.isna(cand_end):
+                continue
+            meter_open = open_broken[open_broken["meter_name"].eq(row["meter_name"])]
+            if (meter_open["start_date"].isna() | (meter_open["start_date"] <= cand_end)).any():
+                combined_candidates.loc[idx, "suggestion"] = "review_remove_broken"
 
         combined_candidates = combined_candidates.sort_values(
             by=["meter_name", "start_datetime", "issue_type"],
@@ -2099,6 +2188,8 @@ def plot_review_meters_with_overlays(
             ),
             notes=[
                 "Red and blue shaded intervals may overlap and appear purple.",
+                "Purple on an open-ended red interval (suggestion review_remove_broken): "
+                "use solution remove_broken if the meter is not actually broken.",
                 "A black dashed line marks the detected restart or drop timestamp.",
                 "Each red interval is labeled with its status and dates; a blank start or end means it is open.",
                 "Candidate issue type and R² appear in the box at the top left of each plot.",
