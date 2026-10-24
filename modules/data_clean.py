@@ -17,6 +17,7 @@ from matplotlib.patches import Patch
 
 # 'broken' is treated like a removal style correction
 ALLOWED_CORRECTION_SOLUTIONS = {"broken", "remove", "div100", "no_interp"}
+# {"broken", "fixed_meter", "remove_broken", "remove", "div100", "no_interp"}
 BROKEN_STATUS_VALUES = {"broken", "repaired", "under_renovation", "no_meter"}
 
 ###################################################################
@@ -935,22 +936,72 @@ def _build_simple_key(df):
     )
 
 
+# adds approved "broken" candidate rows to the running broken meter csv (in its M/D/YYYY format)
+def add_candidates_to_broken_list(broken_candidates, broken_meters_file, data_source="harvest"):
+    def to_text(value):
+        if pd.isna(value):
+            return ""
+        value = pd.Timestamp(value)
+        text = f"{value.month}/{value.day}/{value.year}"
+        if value != value.normalize():
+            text += value.strftime(" %H:%M:%S")
+        return text
+
+    if os.path.exists(broken_meters_file):
+        broken_raw = pd.read_csv(broken_meters_file, dtype=str, keep_default_na=False)
+        existing = load_broken_meter_workbook(broken_meters_file)
+        existing_keys = set(zip(existing["meter_name"], existing["start_date"]))
+    else:
+        broken_raw = pd.DataFrame(columns=[
+            "meter_name", "start_date", "end_date", "status",
+            "description", "data_source", "updated_data"
+        ])
+        existing_keys = set()
+
+    today = pd.Timestamp.today().normalize()
+    new_rows = []
+    for _, row in broken_candidates.iterrows():
+        start = pd.to_datetime(row["start_datetime"], errors="coerce")
+        # skip meters already listed as broken from the same start
+        if (row["meter_name"], start) in existing_keys:
+            continue
+        new_rows.append({
+            "meter_name": row["meter_name"],
+            "start_date": to_text(start),
+            "end_date": to_text(row["end_datetime"]),
+            "status": "broken",
+            "description": row["description"],
+            "data_source": data_source,
+            "updated_data": to_text(today),
+        })
+
+    if new_rows:
+        broken_raw = pd.concat([broken_raw, pd.DataFrame(new_rows)], ignore_index=True, sort=False)
+        broken_raw.to_csv(broken_meters_file, index=False)
+
+    print(f"{len(new_rows)} approved broken candidate(s) added to {broken_meters_file}")
+
+
+
 # master sheet sync for official corrections, approved candidates, and broken-meter rows.
 def sync_meter_corrections_master_sheet(
     candidate_file,
     broken_meters_file,
     meter_corrections_file,
-    window_start,
-    window_end,
+    data_source="harvest",
 ):
     """
-    Build the master corrections file from:
-    - approved candidate rows (approved == 1 and solution filled in)
-    - broken meter rows from the running broken meter file
-    """
-    window_start = pd.to_datetime(window_start)
-    window_end = pd.to_datetime(window_end)
+    Update the master corrections file. Rows already in it stay every run, except
+    broken-list rows, which are rebuilt from the running broken meter file so edits,
+    end dates and deletions there carry over.
 
+    The updated file is:
+    - existing master rows that did not come from the broken list
+      (approved candidates from earlier runs, stuck_run rows, hand-added rows)
+    - approved candidate rows (approved == 1 and solution filled in); rows with
+      solution "broken" are added to the running broken meter file instead (with data_source)
+    - every row from the running broken meter file
+    """
     master_cols = [
         "meter_name",
         "solution",
@@ -961,13 +1012,32 @@ def sync_meter_corrections_master_sheet(
     ]
     master_df = pd.DataFrame(columns=master_cols)
 
+    if os.path.exists(meter_corrections_file):
+        old_master = pd.read_csv(meter_corrections_file, low_memory=False).reindex(columns=master_cols)
+        old_master["start_datetime"] = pd.to_datetime(old_master["start_datetime"], errors="coerce")
+        old_master["end_datetime"] = pd.to_datetime(old_master["end_datetime"], errors="coerce")
+
+        # broken-list rows are identified by their status and replaced below
+        from_broken_list = (
+            old_master["issue_type/status"].fillna("").astype(str).str.strip().str.lower()
+            .isin(BROKEN_STATUS_VALUES)
+        )
+        master_df = old_master[~from_broken_list].copy()
+
     existing_candidates = load_existing_candidates(candidate_file)
-    broken_df = load_broken_meter_workbook(broken_meters_file)
 
     approved_candidates = existing_candidates[
         (existing_candidates["approved"] == 1) &
         (existing_candidates["solution"] != "")
     ].copy()
+
+    # approved "broken" candidates go to the running broken list, and reach the master sheet from there
+    is_broken = approved_candidates["solution"].eq("broken")
+    if is_broken.any():
+        add_candidates_to_broken_list(approved_candidates[is_broken], broken_meters_file, data_source)
+    approved_candidates = approved_candidates[~is_broken]
+
+    broken_df = load_broken_meter_workbook(broken_meters_file)
 
     if not approved_candidates.empty:
         approved_candidates = approved_candidates.rename(
@@ -980,20 +1050,11 @@ def sync_meter_corrections_master_sheet(
 
     broken_rows = []
     for _, row in broken_df.iterrows():
-        true_start = pd.to_datetime(row["start_date"], errors="coerce")
-        true_end = pd.to_datetime(row["end_date"], errors="coerce")
-
-        overlap_start = window_start if pd.isna(true_start) else max(true_start, window_start)
-        overlap_end = window_end if pd.isna(true_end) else min(true_end, window_end)
-
-        if overlap_start > overlap_end:
-            continue
-
         broken_rows.append({
             "meter_name": row["meter_name"],
             "solution": "remove",
-            "start_datetime": true_start,
-            "end_datetime": true_end,
+            "start_datetime": pd.to_datetime(row["start_date"], errors="coerce"),
+            "end_datetime": pd.to_datetime(row["end_date"], errors="coerce"),
             "issue_type/status": row["status"],
             "description": row["description"],
         })
@@ -1021,6 +1082,40 @@ def sync_meter_corrections_master_sheet(
 
 
 
+# adds auto-approved stuck_run rows straight to the master corrections file
+def add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file):
+    master_cols = [
+        "meter_name",
+        "solution",
+        "start_datetime",
+        "end_datetime",
+        "issue_type/status",
+        "description",
+    ]
+
+    new_rows = stuck_rows.rename(columns={"issue_type": "issue_type/status"}).reindex(columns=master_cols)
+
+    if os.path.exists(meter_corrections_file):
+        master_df = pd.read_csv(meter_corrections_file, low_memory=False).reindex(columns=master_cols)
+    else:
+        master_df = pd.DataFrame(columns=master_cols)
+
+    master_df = pd.concat([master_df, new_rows], ignore_index=True, sort=False)
+    master_df["start_datetime"] = pd.to_datetime(master_df["start_datetime"], errors="coerce")
+    master_df["end_datetime"] = pd.to_datetime(master_df["end_datetime"], errors="coerce")
+
+    master_df["_key"] = _build_simple_key(master_df)
+    master_df = master_df.drop_duplicates(subset="_key", keep="first").drop(columns="_key")
+    master_df = master_df.sort_values(
+        by=["meter_name", "start_datetime", "solution", "issue_type/status"],
+        na_position="last"
+    ).reset_index(drop=True)
+
+    master_df.to_csv(meter_corrections_file, index=False)
+    print(f"{len(new_rows)} stuck_run row(s) added to master correction file {meter_corrections_file}")
+
+
+
 # candidate workbook updater for unresolved review rows and new detected issues
 def update_special_meter_candidates_workbook(
     data,
@@ -1030,6 +1125,8 @@ def update_special_meter_candidates_workbook(
     window_end,
     df_bad_meters=None,
     df_restarts=None,
+    meter_corrections_file=None,
+    stuck_solution="remove",
 ):
     """
     Rules:
@@ -1042,6 +1139,8 @@ def update_special_meter_candidates_workbook(
     - exclude all-NaN rows when the broken interval covers the full review window
     - exclude interval rows fully inside broken-meter intervals
     - do not create blue missing rows for meters broken across the full window
+    - stuck_run rows skip review: if meter_corrections_file is given they are written
+      straight to the master sheet with solution stuck_solution, and left out of the candidate file
     """
     window_start = pd.to_datetime(window_start)
     window_end = pd.to_datetime(window_end)
@@ -1348,6 +1447,16 @@ def update_special_meter_candidates_workbook(
 
         combined_candidates["_key"] = temp["_key"]
         combined_candidates = combined_candidates.drop_duplicates(subset="_key", keep="first").drop(columns="_key")
+
+        # stuck runs skip review: they go straight to the master sheet, not the candidate file
+        is_stuck = temp.loc[combined_candidates.index, "issue_type"].eq("stuck_run")
+        stuck_rows = combined_candidates[is_stuck].copy()
+        combined_candidates = combined_candidates[~is_stuck]
+
+        if meter_corrections_file is not None and not stuck_rows.empty:
+            stuck_rows["solution"] = stuck_solution
+            add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file)
+
         combined_candidates = combined_candidates.sort_values(
             by=["meter_name", "start_datetime", "issue_type"],
             na_position="last",
@@ -1684,6 +1793,28 @@ def _plot_single_meter_review(
                     alpha=0.20,
                 )
 
+                # label the band with its broken dates (open start/end left blank)
+                if "broken_dates" in annotation_fields:
+                    start_text = "" if pd.isna(raw_start) else f"{raw_start.month}/{raw_start.day}/{raw_start.year}"
+                    end_text = "" if pd.isna(raw_end) else f"{raw_end.month}/{raw_end.day}/{raw_end.year}"
+                    status = str(row.get("status", "")).strip()
+                    label = f"{status} {start_text} – {end_text}".strip()
+
+                    # narrow bands get a vertical label so it doesn't spill over the plot
+                    narrow = (end - start) < (plot_end - plot_start) * 0.12
+                    ax.text(
+                        start + (end - start) / 2 if narrow else start,
+                        0.03,
+                        label,
+                        transform=ax.get_xaxis_transform(),
+                        ha="center" if narrow else "left",
+                        va="bottom",
+                        rotation=90 if narrow else 0,
+                        fontsize=8,
+                        color="darkred",
+                        clip_on=True,
+                    )
+
     if not meter_candidates.empty:
         for _, row in meter_candidates.iterrows():
             issue_type = str(row.get("issue_type", "")).strip().lower()
@@ -1769,8 +1900,8 @@ def _plot_single_meter_review(
         ]
         if issue_types:
             label = (
-                "Candidate issue type: "
-                if "status" in annotation_fields
+                "Issue type: "
+                if "status" in annotation_fields or "broken_dates" in annotation_fields
                 else "Issue type: "
             )
             annotation_lines.append(label + ", ".join(issue_types))
@@ -1969,7 +2100,8 @@ def plot_review_meters_with_overlays(
             notes=[
                 "Red and blue shaded intervals may overlap and appear purple.",
                 "A black dashed line marks the detected restart or drop timestamp.",
-                "Issue_type and R² information may appear inside individual plots.",
+                "Each red interval is labeled with its status and dates; a blank start or end means it is open.",
+                "Candidate issue type and R² appear in the box at the top left of each plot.",
             ],
         )
 
@@ -1982,7 +2114,7 @@ def plot_review_meters_with_overlays(
                 removed_df=None,
                 meter_type_map=meter_type_map,
                 ylabel=ylabel,
-                annotation_fields=("issue_type", "r2"),
+                annotation_fields=("broken_dates", "issue_type", "r2"),
             )
             if fig is None:
                 continue
@@ -3237,7 +3369,7 @@ def plot_data(df, var, txt="original", fig_path="./"):
             # plt.show()
             plt.close()
 
-    print(f"✅ Multi-page PDF saved to: {pdf_path}")
+    print(f"Multi-page PDF saved to: {pdf_path}")
 
 
 
@@ -3245,69 +3377,26 @@ def plot_data(df, var, txt="original", fig_path="./"):
 ###################################################################
 
 def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=None):
-    # ===== ORIGINAL ZHILING / AURORA CODE (commented out) =====
-    #     """
-    #     Clean stuck points, apply special 'no_interp' corrections, and interpolate.
-    #     Restart intervals are set to 0 before interpolation.
-    #
-    #     Args:
-    #         column: pd.Series (time-indexed meter data)
-    #         flags: pd.Series of same length to track interpolated points
-    #         df_restarts: pd.DataFrame with columns ['meter_name', 'previous_valid_time', 'restart_time']
-    #         special_meters_file: Excel file with columns ['meter_name', 'start_datetime', 'end_datetime', 'solution']
-    #
-    #     Returns:
-    #         pd.Series: cleaned and interpolated column
-    #     """
-    #     column_cp = column.copy()
-    #
-    #     # STEP 0: Apply 'no_interp' periods from special_meters_file
-    #     if special_meters_file is not None:
-    #         bad_periods = pd.read_csv(special_meters_file)
-    #         bad_periods["meter_name"] = bad_periods["meter_name"].astype(str).str.strip()
-    #         bad_periods["solution"] = bad_periods["solution"].astype(str).str.strip().str.lower()
-    #         bad_periods["start_datetime"] = pd.to_datetime(bad_periods["start_datetime"])
-    #         bad_periods["end_datetime"] = pd.to_datetime(bad_periods["end_datetime"])
-    #         # Only keep periods relevant for this column
-    #         bad_periods = bad_periods[
-    #             (bad_periods["meter_name"] == column.name) &
-    #             (bad_periods["solution"] == "no_interp")
-    #         ]
-    #
-    #         for _, row in bad_periods.iterrows():
-    #             start = row["start_datetime"]
-    #             end = row["end_datetime"]
-    #             mask = (column.index >= start) & (column.index <= end)
-    #             column.loc[mask] = 0  # replace with 0 for no_interp
-    #
-    #     # STEP 1: Remove stuck points (consecutive duplicates except 0)
-    #     mask_stuck = (column.duplicated(keep='first')) & (column != 0.)
-    #     column = column.mask(mask_stuck)
-    #
-    #     # STEP 2: Replace restart periods with 0
-    #     if df_restarts is not None and not df_restarts.empty:
-    #         restarts_for_col = df_restarts[df_restarts['meter_name'] == column.name]
-    #         for _, r in restarts_for_col.iterrows():
-    #             start = r['previous_valid_time']
-    #             end = r['restart_time']
-    #             column.loc[start:end] = 0
-    #
-    #     # STEP 3: Interpolate the entire column
-    #     column_interpolated = column.interpolate(method='linear')
-    #     column[:] = column_interpolated
-    #
-    #     # STEP 4: Update flags for interpolated values
-    #     changed_mask = (column_cp != column) & column.notna()
-    #     flags[:] = np.where(changed_mask, 1, flags)
-    #
-    #     return column
-
     """
     Clean stuck points, apply optional no_interp corrections, and interpolate.
-    Restart intervals are set to 0 before interpolation.
+    no_interp windows and restart intervals are set to 0 and are never interpolated
+    across: each stretch between them is interpolated on its own, so a 0 is never
+    used as an interpolation end point.
+
+    Input Args:
+        column: pd.Series (time-indexed meter data)
+        flags: pd.Series of same length to track interpolated points
+        df_restarts: pd.DataFrame with columns ['meter_name', 'previous_valid_time', 'restart_time']
+        special_meters_file: CSV file with columns ['meter_name', 'start_datetime', 'end_datetime', 'solution']
+
+    Output Returns:
+        pd.Series: cleaned and interpolated column
     """
     column_cp = column.copy()
     column = column.copy()
+
+    # no_interp windows + restart intervals: set to 0 and not interpolated across
+    blocked = pd.Series(False, index=column.index)
 
     if (
         special_meters_file is not None
@@ -3332,6 +3421,7 @@ def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=N
                 end = row["end_datetime"]
                 mask = (column.index >= start) & (column.index <= end)
                 column.loc[mask] = 0
+                blocked |= mask
 
     mask_stuck = (column.duplicated(keep="first")) & (column != 0.0)
     column = column.mask(mask_stuck)
@@ -3341,10 +3431,19 @@ def clean_and_interpolate(column, flags, df_restarts=None, special_meters_file=N
         for _, r in restarts_for_col.iterrows():
             start = pd.to_datetime(r["previous_valid_time"])
             end = pd.to_datetime(r["restart_time"])
-            column.loc[start:end] = 0
+            mask = (column.index >= start) & (column.index <= end)
+            column.loc[mask] = 0
+            blocked |= mask
 
-    column_interpolated = column.interpolate(method="linear")
-    column[:] = column_interpolated
+    # Interpolate each stretch between blocked points separately
+    # (interpolating the whole column would draw a line up from the 0s)
+    segment_id = blocked.cumsum()
+    open_points = ~blocked
+    column.loc[open_points] = (
+        column[open_points]
+        .groupby(segment_id[open_points])
+        .transform(lambda s: s.interpolate(method="linear"))
+    )
 
     changed_mask = (column_cp != column) & column.notna()
     flags[:] = np.where(changed_mask, 1, flags)
@@ -3369,11 +3468,11 @@ def reshape_interpolated_data(df, interpolation_flags):
     Reshape the dataframe and merge with interpolation_flags. 
     
     Input Args:
-    df: a pandas dataframe
-    interpolation_flags: a pandas dataframe with the same shape as df, containing is_interpolated flags of values in df
+        df: a pandas dataframe
+        interpolation_flags: a pandas dataframe with the same shape as df, containing is_interpolated flags of values in df
         
     Output Returns:
-    final_df: combined and reshaped dataframe
+        final_df: combined and reshaped dataframe
     """
           
     # Step 1: Join df with interpolation_flags
