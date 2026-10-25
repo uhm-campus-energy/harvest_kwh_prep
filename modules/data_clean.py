@@ -1637,6 +1637,20 @@ def get_review_plot_legend_handles(
     return handles
 
 
+REPORT_RANGE_LINE_STYLE = dict(color="green", linestyle=":", linewidth=1.6)
+
+
+def _report_range_legend_handle():
+    return Line2D([0], [0], label="Report range start / end", **REPORT_RANGE_LINE_STYLE)
+
+
+def _draw_report_range(ax, report_start=None, report_end=None):
+    """Vertical lines at the report range edges (e.g. fiscal year) when the plot shows a wider data range."""
+    for edge in (report_start, report_end):
+        if edge is not None:
+            ax.axvline(pd.to_datetime(edge), alpha=0.9, **REPORT_RANGE_LINE_STYLE)
+
+
 def _add_pdf_legend_page(
     pdf,
     title,
@@ -1746,12 +1760,15 @@ def _plot_single_meter_review(
     annotation_fields=("issue_type", "r2"),
     title_suffix="",
     footer_note="",
+    report_start=None,
+    report_end=None,
 ):
     """
     Draw one review meter graph.
 
     This is the shared plotting engine used by endpoint review PDFs,
     maintenance review PDFs, and approved change preview PDFs.
+    report_start / report_end (optional) draw vertical report range lines.
     """
     if data is None or data.empty:
         raise ValueError("data is empty.")
@@ -1839,6 +1856,7 @@ def _plot_single_meter_review(
         linewidth=1.2,
     )
     ax.set_xlim(plot_start, plot_end)
+    _draw_report_range(ax, report_start, report_end)
 
     # label meter '[main]' or '[sub]' on plot
     meter_type = ""
@@ -2056,13 +2074,16 @@ def plot_all_meters_to_pdf(
     ylabel="meter_reading",
     line_label="Corrected meter reading",
     meter_type_map=None,
+    report_start=None,
+    report_end=None,
 ):
     """
     Plot every meter in the current dataframe to one PDF.
 
     This function is currently called with data_corrected in
     1.kwh_end_points.ipynb, so each page identifies the line as
-    corrected meter data.
+    corrected meter data. report_start / report_end (optional) draw
+    vertical report range lines.
     """
     if data is None or data.empty:
         print("No data available for all-meter plotting.")
@@ -2090,6 +2111,8 @@ def plot_all_meters_to_pdf(
                 label=line_label,
             ),
         ]
+        if report_start is not None or report_end is not None:
+            all_meter_legend_handles.append(_report_range_legend_handle())
 
         _add_pdf_legend_page(
             pdf=pdf,
@@ -2121,6 +2144,7 @@ def plot_all_meters_to_pdf(
                 label=line_label,
             )
             ax.set_xlim(data_start, data_end)
+            _draw_report_range(ax, report_start, report_end)
 
             meter_name_norm = str(meter_name).strip().lower()
             meter_type = normalized_type_map.get(meter_name_norm, "")
@@ -2151,10 +2175,13 @@ def plot_review_meters_with_overlays(
     plot_file,
     ylabel="kWh",
     meter_type_map=None,
+    report_start=None,
+    report_end=None,
 ):
     """
     Create the kwh_end_points.ipynb review PDF using the shared meter plot function
     with red broken meter overlays and blue candidate overlays.
+    report_start / report_end (optional) draw vertical report range lines.
     """
     if data is None or data.empty:
         raise ValueError("data is empty.")
@@ -2178,15 +2205,19 @@ def plot_review_meters_with_overlays(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    review_handles = get_review_plot_legend_handles(
+        include_candidates=True,
+        include_removed=False,
+    )
+    if report_start is not None or report_end is not None:
+        review_handles.append(_report_range_legend_handle())
+
     saved_count = 0
     with PdfPages(plot_file) as pdf:
         _add_pdf_legend_page(
             pdf=pdf,
             title="Review Meter Plots",
-            handles=get_review_plot_legend_handles(
-                include_candidates=True,
-                include_removed=False,
-            ),
+            handles=review_handles,
             description=(
                 "These plots show raw meter readings together with broken meter "
                 "intervals and unresolved candidate issues."
@@ -2211,6 +2242,8 @@ def plot_review_meters_with_overlays(
                 meter_type_map=meter_type_map,
                 ylabel=ylabel,
                 annotation_fields=("broken_dates", "issue_type", "r2"),
+                report_start=report_start,
+                report_end=report_end,
             )
             if fig is None:
                 continue
@@ -2987,12 +3020,13 @@ def _seconds_since(index, ref):
     return np.asarray((index - ref) / pd.Timedelta(seconds=1), dtype=float)
 
 
-def _meter_interp_segments(series, ref, r2_num, info, meter_restarts):
+def _meter_interp_segments(series, ref, r2_num, info, meter_restarts, report_lo=None, report_hi=None):
     """
     Split one meter's valid readings into continuous counter segments.
 
     - Stuck edge runs (R²=-2) are removed first, using the stuck length
-      in info (e.g. "stuck 120 pts at start").
+      in info (e.g. "stuck 120 pts at start"). The run is counted from the
+      report range edge (report_lo / report_hi) when given, else the series edge.
     - Restart meters (R²=-3) are cut at each restart: one segment ends at
       previous_valid_time and the next starts at restart_time, because the
       counter can't be interpolated across a reset.
@@ -3005,10 +3039,13 @@ def _meter_interp_segments(series, ref, r2_num, info, meter_restarts):
         tokens = str(info).split()
         stuck_len = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else 0
         if stuck_len > 1:
+            # position of the report range edges in the series (whole series if not given)
+            lo_pos = 0 if report_lo is None else int(y.index.searchsorted(report_lo, side="left"))
+            hi_pos = len(y) if report_hi is None else int(y.index.searchsorted(report_hi, side="right"))
             if "start" in info:
-                y.iloc[:stuck_len] = np.nan
+                y.iloc[lo_pos:lo_pos + stuck_len] = np.nan
             elif "end" in info:
-                y.iloc[-stuck_len:] = np.nan
+                y.iloc[max(hi_pos - stuck_len, 0):hi_pos] = np.nan
 
     y = y.dropna()
     if len(y) < 2:
@@ -3088,6 +3125,7 @@ def _compute_interp_window_differences(
     min_covered_fn,
     r2_threshold=0.9,
     restarts_thres=5,
+    min_real_points=None,
 ):
     """
     Shared engine for compute_meter_differences and
@@ -3096,10 +3134,17 @@ def _compute_interp_window_differences(
     windows: list of (label, window_start, window_end) timestamps.
     min_covered_fn: window length (s) -> minimum covered seconds required
         before a partly-covered window is scaled up.
+    min_real_points: if given, a window with fewer real (non-NaN) readings
+        inside it is left NaN, so a window that is mostly interpolated from
+        readings outside it isn't reported.
 
     Segments are built once from the full `data` (not per window), so a
     boundary inside a gap is interpolated using the valid readings on either
-    side of it, even when those readings fall in a neighbouring month.
+    side of it, even when those readings fall in a neighbouring month or
+    outside the report range (data range wider than the windows).
+
+    Only restarts inside the report range (first window start to last window
+    end) count toward restarts_thres.
     """
     bad_dict = {}
     if df_bad_meters is not None and not df_bad_meters.empty:
@@ -3120,6 +3165,10 @@ def _compute_interp_window_differences(
         for label, ws, we in windows
     ]
 
+    # report range = span of all windows
+    report_lo = min(pd.to_datetime(ws) for _, ws, _ in windows)
+    report_hi = max(pd.to_datetime(we) for _, _, we in windows)
+
     results = []
     for meter_name in data.columns:
         series = data[meter_name]
@@ -3130,29 +3179,45 @@ def _compute_interp_window_differences(
             r2_num, info_val, r2_val = np.nan, "", f">= {r2_threshold}"
 
         meter_restarts = None
+        restarts_in_report = 0
         if df_restarts is not None and not df_restarts.empty:
             meter_restarts = df_restarts[df_restarts["meter_name"] == meter_name]
+            restart_times = pd.to_datetime(meter_restarts["restart_time"])
+            restarts_in_report = int(restart_times.between(report_lo, report_hi).sum())
 
         # Excluded (left NaN): unreadable R², all NaN, too few points,
-        # low R² with no correction rule, too many restarts
+        # low R² with no correction rule, too many restarts in the report range
         usable = meter_name not in bad_dict or (
             not np.isnan(r2_num)
             and r2_num in (-1, -2, -3)
-            and not (r2_num == -3 and len(meter_restarts) > restarts_thres)
+            and not (r2_num == -3 and restarts_in_report > restarts_thres)
         )
 
         segments = (
-            _meter_interp_segments(series, ref, r2_num, info_val, meter_restarts)
+            _meter_interp_segments(
+                series, ref, r2_num, info_val, meter_restarts,
+                report_lo=report_lo, report_hi=report_hi,
+            )
             if usable else []
         )
 
-        for label, a, b in win_s:
+        for (label, a, b), (_, ws, we) in zip(win_s, windows):
             st_time = en_time = pd.NaT
             start_val = end_val = np.nan
             raw_diff = scaled_diff = interp_kwh = np.nan
             pct_interp = pct_scaled = np.nan
+            row_info = info_val
 
-            if usable:
+            window_usable = usable
+            if usable and min_real_points is not None:
+                real_points = int(series.loc[ws:we].notna().sum())
+                if real_points < min_real_points:
+                    window_usable = False
+                    row_info = (
+                        f"{info_val}; " if info_val else ""
+                    ) + f"too few real readings in window ({real_points})"
+
+            if window_usable:
                 u = _interp_usage_over_window(segments, a, b, max_step)
                 window_s = b - a
 
@@ -3179,7 +3244,7 @@ def _compute_interp_window_differences(
                 st_time, start_val,
                 en_time, end_val,
                 raw_diff, scaled_diff, interp_kwh,
-                r2_val, info_val,
+                r2_val, row_info,
                 pct_interp, pct_scaled,
             ))
 
@@ -3228,7 +3293,12 @@ def compute_meter_differences(
     gap) aren't bracketed by valid readings.
 
     Scaling requires at least valid_len intervals of covered time; meters
-    with less coverage are left NaN ("N/A").
+    with less coverage are left NaN ("N/A"). Meters with fewer than valid_len
+    real readings inside start_time -> end_time are also left NaN, so a year
+    interpolated mostly from readings outside it isn't reported.
+
+    `data` can cover a wider data range than start_time -> end_time; readings
+    outside the report range are used to interpolate across its edges.
 
     raw_difference = measured + interpolated (unscaled);
     difference - raw_difference = the scaled (extrapolated) kWh.
@@ -3248,6 +3318,7 @@ def compute_meter_differences(
         min_covered_fn=lambda window_s: min_covered_s,
         r2_threshold=r2_threshold,
         restarts_thres=restarts_thres,
+        min_real_points=valid_len,
     )
     return result_df.drop(columns="month").set_index("meter_name")
 
@@ -3270,6 +3341,9 @@ def compute_monthly_meter_differences(
     A month is scaled only for time not bracketed by valid readings, and only
     if at least monthly_min_valid_fraction of the month is covered; months
     with less coverage are left NaN ("N/A").
+
+    `data` can cover a wider data range than start_time -> end_time; readings
+    outside the report range are used to interpolate across its edges.
 
     Returns a long format DataFrame with one row per (meter_name, month).
     """
