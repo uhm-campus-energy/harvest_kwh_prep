@@ -781,11 +781,14 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
 ###################################################################
 
 # shared text normalizer for the broken meter workflow.
-def _normalize_text(value, underscore=False):
+# lower=False keeps the original capitalization (used for free-text descriptions).
+def _normalize_text(value, underscore=False, lower=True):
     if pd.isna(value):
         return ""
 
-    value = str(value).strip().lower()
+    value = str(value).strip()
+    if lower:
+        value = value.lower()
 
     if underscore:
         value = re.sub(r"[\s\-]+", "_", value)
@@ -835,7 +838,7 @@ def load_broken_meter_workbook(broken_meters_file, dayfirst=False):
 
     df["meter_name"] = df["meter_name"].apply(_normalize_text)
     df["status"] = df["status"].apply(lambda x: _normalize_text(x, underscore=True))
-    df["description"] = df["description"].apply(_normalize_text)
+    df["description"] = df["description"].apply(lambda x: _normalize_text(x, lower=False))
     df["data_source"] = df["data_source"].apply(_normalize_text)
     df["updated_data"] = _parse_strict_date_series(df["updated_data"], "updated_data")
     df["start_date"] = _parse_strict_date_series(df["start_date"], "start_date")
@@ -2647,7 +2650,7 @@ def apply_broken_meter_update_actions(
 
     reviewed_broken_df["meter_name"] = reviewed_broken_df["meter_name"].apply(_normalize_text)
     reviewed_broken_df["status"] = reviewed_broken_df["status"].apply(lambda value: _normalize_text(value, underscore=True))
-    reviewed_broken_df["description"] = reviewed_broken_df["description"].apply(_normalize_text)
+    reviewed_broken_df["description"] = reviewed_broken_df["description"].apply(lambda value: _normalize_text(value, lower=False))
     reviewed_broken_df["data_source"] = reviewed_broken_df["data_source"].apply(_normalize_text)
     reviewed_broken_df["start_date"] = pd.to_datetime(reviewed_broken_df["start_date"], errors="coerce")
     reviewed_broken_df["end_date"] = pd.to_datetime(reviewed_broken_df["end_date"], errors="coerce")
@@ -2729,7 +2732,7 @@ def apply_broken_meter_update_actions(
                 else old_row["status"]
             )
             new_desc = (
-                _normalize_text(log_row["new_description"])
+                _normalize_text(log_row["new_description"], lower=False)
                 if _log_value_is_filled(log_row["new_description"])
                 else old_row["description"]
             )
@@ -2781,7 +2784,7 @@ def apply_broken_meter_update_actions(
                 log_row["new_status"],
                 underscore=True,
             )
-            new_desc = _normalize_text(log_row["new_description"])
+            new_desc = _normalize_text(log_row["new_description"], lower=False)
 
             if new_status == "":
                 raise ValueError(
@@ -2798,7 +2801,7 @@ def apply_broken_meter_update_actions(
             duplicate_mask = (
                 reviewed_broken_df["meter_name"].eq(meter_name)
                 & reviewed_broken_df["status"].eq(new_status)
-                & reviewed_broken_df["description"].eq(new_desc)
+                & reviewed_broken_df["description"].str.lower().eq(new_desc.lower())
                 & reviewed_broken_df["start_date"].apply(datetime_to_text).eq(datetime_to_text(new_start))
                 & reviewed_broken_df["end_date"].apply(datetime_to_text).eq(datetime_to_text(new_end))
             )
