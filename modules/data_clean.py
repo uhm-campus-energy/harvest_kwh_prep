@@ -863,6 +863,7 @@ def load_existing_candidates(candidate_file):
         "suggestion",
         "r2",
         "approved",
+        "data_source",
     ]
 
     if candidate_file is None or not os.path.exists(candidate_file):
@@ -881,10 +882,11 @@ def load_existing_candidates(candidate_file):
 
     for col in cols:
         if col not in df.columns:
-            df[col] = np.nan if col not in {"solution", "description", "suggestion"} else ""
+            df[col] = np.nan if col not in {"solution", "description", "suggestion", "data_source"} else ""
 
     df = df[cols].copy()
     df["meter_name"] = df["meter_name"].apply(_normalize_text)
+    df["data_source"] = df["data_source"].apply(_normalize_text)
     df["start_datetime"] = _parse_strict_date_series(df["start_datetime"], "start_datetime")
     df["end_datetime"] = _parse_strict_date_series(df["end_datetime"], "end_datetime")
     df["approved"] = pd.to_numeric(df["approved"], errors="coerce").fillna(0).astype(int)
@@ -975,7 +977,8 @@ def add_candidates_to_broken_list(broken_candidates, broken_meters_file, data_so
             "end_date": to_text(row["end_datetime"]),
             "status": "broken",
             "description": row["description"],
-            "data_source": data_source,
+            # the candidate's own source, else the run's
+            "data_source": _normalize_text(row.get("data_source", "")) or data_source,
             "updated_data": to_text(today),
         })
 
@@ -1075,6 +1078,9 @@ def sync_meter_corrections_master_sheet(
       solution "broken" are added to the running broken meter file instead (with data_source),
       and rows with solution "remove_broken" delete the overlapping open-ended row from it
     - every row from the running broken meter file
+
+    data_source column: approved candidates keep their own (blank -> data_source),
+    broken-list rows take the broken list's data_source.
     """
     master_cols = [
         "meter_name",
@@ -1083,6 +1089,7 @@ def sync_meter_corrections_master_sheet(
         "end_datetime",
         "issue_type/status",
         "description",
+        "data_source",
     ]
     master_df = pd.DataFrame(columns=master_cols)
 
@@ -1123,9 +1130,8 @@ def sync_meter_corrections_master_sheet(
         approved_candidates = approved_candidates.rename(
             columns={"issue_type": "issue_type/status"}
         )
-        approved_candidates = approved_candidates[
-            ["meter_name", "solution", "start_datetime", "end_datetime", "issue_type/status", "description"]
-        ].copy()
+        approved_candidates = approved_candidates[master_cols].copy()
+        approved_candidates["data_source"] = approved_candidates["data_source"].replace("", data_source)
         master_df = pd.concat([master_df, approved_candidates], ignore_index=True, sort=False)
 
     broken_rows = []
@@ -1137,6 +1143,7 @@ def sync_meter_corrections_master_sheet(
             "end_datetime": pd.to_datetime(row["end_date"], errors="coerce"),
             "issue_type/status": row["status"],
             "description": row["description"],
+            "data_source": row["data_source"],
         })
 
     if broken_rows:
@@ -1171,6 +1178,7 @@ def add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file):
         "end_datetime",
         "issue_type/status",
         "description",
+        "data_source",
     ]
 
     new_rows = stuck_rows.rename(columns={"issue_type": "issue_type/status"}).reindex(columns=master_cols)
@@ -1207,6 +1215,7 @@ def update_special_meter_candidates_workbook(
     df_restarts=None,
     meter_corrections_file=None,
     stuck_solution="remove",
+    data_source="harvest",
 ):
     """
     Rules:
@@ -1223,6 +1232,7 @@ def update_special_meter_candidates_workbook(
       straight to the master sheet with solution stuck_solution, and left out of the candidate file
     - rows overlapping an open-ended broken-meter row get suggestion "review_remove_broken"
       (approve with solution remove_broken if the meter is not actually broken)
+    - new rows get data_source (from the schema); unresolved rows keep the one they had
     """
     window_start = pd.to_datetime(window_start)
     window_end = pd.to_datetime(window_end)
@@ -1237,6 +1247,7 @@ def update_special_meter_candidates_workbook(
         "suggestion",
         "r2",
         "approved",
+        "data_source",
     ]
 
     def summary_info_to_issue_type(info):
@@ -1415,11 +1426,11 @@ def update_special_meter_candidates_workbook(
 
     for col in candidate_cols:
         if col not in unresolved_candidates.columns:
-            unresolved_candidates[col] = np.nan if col not in {"solution", "description", "suggestion"} else ""
+            unresolved_candidates[col] = np.nan if col not in {"solution", "description", "suggestion", "data_source"} else ""
 
     for col in candidate_cols:
         if col not in issue_df.columns:
-            issue_df[col] = np.nan if col not in {"solution", "description", "suggestion"} else ""
+            issue_df[col] = np.nan if col not in {"solution", "description", "suggestion", "data_source"} else ""
 
     unresolved_candidates = unresolved_candidates.reindex(columns=candidate_cols)
     issue_df = issue_df.reindex(columns=candidate_cols)
@@ -1505,6 +1516,11 @@ def update_special_meter_candidates_workbook(
         ],
         ignore_index=True,
         sort=False,
+    )
+
+    # new rows get this run's data source; unresolved rows keep theirs
+    combined_candidates["data_source"] = (
+        combined_candidates["data_source"].fillna("").astype(str).str.strip().replace("", data_source)
     )
 
     if not combined_candidates.empty:
