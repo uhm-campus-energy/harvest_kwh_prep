@@ -856,14 +856,14 @@ def load_existing_candidates(candidate_file):
     cols = [
         "meter_name",
         "solution",
+        "approved",
         "start_datetime",
         "end_datetime",
         "issue_type",
-        "description",
         "suggestion",
         "r2",
-        "approved",
         "data_source",
+        "description",
     ]
 
     if candidate_file is None or not os.path.exists(candidate_file):
@@ -1171,6 +1171,11 @@ def sync_meter_corrections_master_sheet(
 
 # adds auto-approved stuck_run rows straight to the master corrections file
 def add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file):
+    _add_rows_to_master_sheet(stuck_rows, meter_corrections_file, "stuck_run")
+
+
+# adds auto-approved rows (issue_type column) straight to the master corrections file
+def _add_rows_to_master_sheet(rows, meter_corrections_file, label):
     master_cols = [
         "meter_name",
         "solution",
@@ -1181,7 +1186,7 @@ def add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file):
         "data_source",
     ]
 
-    new_rows = stuck_rows.rename(columns={"issue_type": "issue_type/status"}).reindex(columns=master_cols)
+    new_rows = rows.rename(columns={"issue_type": "issue_type/status"}).reindex(columns=master_cols)
 
     if os.path.exists(meter_corrections_file):
         master_df = pd.read_csv(meter_corrections_file, low_memory=False).reindex(columns=master_cols)
@@ -1200,7 +1205,127 @@ def add_stuck_runs_to_master_sheet(stuck_rows, meter_corrections_file):
     ).reset_index(drop=True)
 
     master_df.to_csv(meter_corrections_file, index=False)
-    print(f"{len(new_rows)} stuck_run row(s) added to master correction file {meter_corrections_file}")
+    print(f"{len(new_rows)} {label} row(s) added to master correction file {meter_corrections_file}")
+
+
+
+def find_recovered_drops(data, max_readings=4):
+    """
+    Find drops the counter recovers from within max_readings timestamps
+    (e.g. the DST fall-back hour, a single bad reading). Missing timestamps
+    count toward max_readings, so a "recovery" across a long gap is not fixed.
+
+    Each drop is fixed by removing the fewest readings, either:
+    - the dip readings below the last good reading, until the counter is back
+      at or above it, or
+    - the high (spike) readings just before the drop
+    Ties remove the dip. Drops that don't recover are left for review (restarts).
+
+    Returns a DataFrame with columns:
+        meter_name, issue_type, start_datetime, end_datetime, description
+    (one row per run of consecutive removed readings)
+    """
+    rows = []
+
+    for meter in data.columns:
+        series = data[meter].dropna()
+        if len(series) < 3:
+            continue
+
+        vals = series.to_numpy(dtype=float)
+        times = series.index
+        steps = data.index.get_indexer(times)  # timestamp positions, so gaps count
+        n = len(vals)
+        removed = np.zeros(n, dtype=bool)
+
+        kept = [0]  # kept readings since the last real drop, non-decreasing
+        i = 1
+        while i < n:
+            prev = kept[-1]
+            if vals[i] >= vals[prev]:
+                kept.append(i)
+                i += 1
+                continue
+
+            # dip: first reading back at/above vals[prev] within max_readings
+            recover = None
+            r = i + 1
+            while r < n and steps[r] - steps[prev] <= max_readings:
+                if vals[r] >= vals[prev]:
+                    recover = r
+                    break
+                r += 1
+            dip_count = recover - i if recover is not None else None
+
+            # spike: kept readings above vals[i], back to one at/below it within max_readings
+            # (or back to the first reading of the series, if it is part of the spike)
+            spike_count = None
+            j = len(kept) - 1
+            while j >= 0 and vals[kept[j]] > vals[i]:
+                j -= 1
+            if j >= 0 and steps[i] - steps[kept[j]] <= max_readings:
+                spike_count = len(kept) - 1 - j
+            elif j < 0 and kept[0] == 0 and steps[i] - steps[0] < max_readings:
+                spike_count = len(kept)
+
+            if dip_count is not None and (spike_count is None or dip_count <= spike_count):
+                removed[i:recover] = True
+                kept.append(recover)
+                i = recover + 1
+            elif spike_count is not None:
+                for k in kept[j + 1:]:
+                    removed[k] = True
+                kept = kept[:j + 1] + [i]
+                i += 1
+            else:
+                # real drop: start a new run from here
+                kept = [i]
+                i += 1
+
+        # one row per run of consecutive removed readings
+        run_start = None
+        for pos in range(n + 1):
+            if pos < n and removed[pos]:
+                if run_start is None:
+                    run_start = pos
+            elif run_start is not None:
+                count = pos - run_start
+                rows.append({
+                    "meter_name": meter,
+                    "issue_type": "recovered_drop",
+                    "start_datetime": times[run_start],
+                    "end_datetime": times[pos - 1],
+                    "description": (
+                        f"{count} reading(s) removed: counter dropped and recovered "
+                        f"within {max_readings} readings."
+                    ),
+                })
+                run_start = None
+
+    return pd.DataFrame(
+        rows,
+        columns=["meter_name", "issue_type", "start_datetime", "end_datetime", "description"],
+    )
+
+
+
+# finds recovered drops and adds them straight to the master corrections file
+# with solution "remove" (no review, like stuck runs)
+def add_recovered_drops_to_master_sheet(
+    data,
+    meter_corrections_file,
+    max_readings=4,
+    data_source="harvest",
+):
+    drop_rows = find_recovered_drops(data, max_readings=max_readings)
+    if drop_rows.empty:
+        print("No recovered drops found.")
+        return drop_rows
+
+    drop_rows["solution"] = "remove"
+    drop_rows["data_source"] = data_source
+    _add_rows_to_master_sheet(drop_rows, meter_corrections_file, "recovered_drop")
+    return drop_rows
 
 
 
@@ -1223,7 +1348,8 @@ def update_special_meter_candidates_workbook(
       fully explained by broken-meter windows
     - remove rows where approved == 1
     - generate new candidate rows from the current data
-    - convert missing-start / missing-end summary issues into real timeframe rows
+    - convert missing-start / missing-end edges into real timeframe rows for every
+      flagged meter (a restart/stuck label can hide them)
     - split missing_start_and_end into two rows
     - exclude all-NaN rows when the broken interval covers the full review window
     - exclude interval rows fully inside broken-meter intervals
@@ -1240,14 +1366,14 @@ def update_special_meter_candidates_workbook(
     candidate_cols = [
         "meter_name",
         "solution",
+        "approved",
         "start_datetime",
         "end_datetime",
         "issue_type",
-        "description",
         "suggestion",
         "r2",
-        "approved",
         "data_source",
+        "description",
     ]
 
     def summary_info_to_issue_type(info):
@@ -1484,15 +1610,18 @@ def update_special_meter_candidates_workbook(
         for row in summary_df.itertuples(index=False):
             meter_name = row.meter_name
             issue_type = row.issue_type
-            info_value = str(row.info).strip().lower()
             r2_value = row.r2
 
             if meter_name in fully_broken_meters and issue_type in {"all_nan", "missing_start", "missing_end", "missing_start_and_end"}:
                 continue
 
-            if issue_type in {"missing_start", "missing_end", "missing_start_and_end"}:
-                summary_row_list.extend(build_edge_missing_rows(meter_name, info_value, r2_value))
-            elif issue_type in {"low_r2", "too_few_points"}:
+            # edge gaps are checked for every flagged meter, not just ones labelled
+            # missing: find_special_meters gives one label each, so a restart or
+            # stuck label can hide a missing start/end
+            if meter_name not in fully_broken_meters:
+                summary_row_list.extend(build_edge_missing_rows(meter_name, "missing start and end", r2_value))
+
+            if issue_type in {"low_r2", "too_few_points"}:
                 summary_row_list.append({
                     "meter_name": meter_name,
                     "solution": "",
@@ -1968,6 +2097,14 @@ def _plot_single_meter_review(
                 start = max(start, plot_start)
                 end = min(end, plot_end)
                 if start <= end:
+                    # bands too narrow to see get drawn as a thin blue line at
+                    # their edge (kept inside the plot) so they still show
+                    min_width = (plot_end - plot_start) * 0.004
+                    if (end - start) < min_width:
+                        if end >= plot_end:
+                            start = end - min_width
+                        else:
+                            end = start + min_width
                     ax.axvspan(
                         start,
                         end,
