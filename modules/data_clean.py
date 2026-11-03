@@ -1352,6 +1352,8 @@ def update_special_meter_candidates_workbook(
       flagged meter (a restart/stuck label can hide them)
     - split missing_start_and_end into two rows
     - exclude all-NaN rows when the broken interval covers the full review window
+    - remaining all-NaN rows get start_datetime = window_start, a blank end and
+      suggestion "broken" (approve with solution broken for an open-ended broken row)
     - exclude interval rows fully inside broken-meter intervals
     - do not create blue missing rows for meters broken across the full window
     - stuck_run rows skip review: if meter_corrections_file is given they are written
@@ -1650,6 +1652,17 @@ def update_special_meter_candidates_workbook(
     # new rows get this run's data source; unresolved rows keep theirs
     combined_candidates["data_source"] = (
         combined_candidates["data_source"].fillna("").astype(str).str.strip().replace("", data_source)
+    )
+
+    # all-NaN meters have no dates of their own: start them at the window start with a
+    # blank end, so approving solution "broken" gives an open-ended broken row
+    is_all_nan = combined_candidates["issue_type"].fillna("").astype(str).str.strip().str.lower().eq("all_nan")
+    combined_candidates.loc[is_all_nan, "start_datetime"] = combined_candidates.loc[
+        is_all_nan, "start_datetime"
+    ].fillna(window_start)
+    combined_candidates.loc[is_all_nan, "suggestion"] = "broken"
+    combined_candidates.loc[is_all_nan, "description"] = (
+        f"No valid readings in the analysis window; broken since at least {window_start:%Y-%m-%d}."
     )
 
     if not combined_candidates.empty:
