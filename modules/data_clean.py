@@ -747,16 +747,34 @@ def suggest_meter_issues(data, stuck_run_threshold=50, jump_multiplier=20, max_r
 
         diffs = series.diff()
 
-        # restarts / drops
+        # restarts / drops: the window is the low readings, from the drop until
+        # the counter is back at or above the reading before it, so solution
+        # "remove" takes out the whole dip. A drop that never recovers (a real
+        # restart) gets a window of just the drop reading.
+        vals = series.to_numpy(dtype=float)
         neg_diffs = diffs[diffs < 0]
         for t, diff_val in neg_diffs.head(max_rows_per_meter).items():
-            prev_idx = series.index[series.index.get_loc(t) - 1] if series.index.get_loc(t) > 0 else pd.NaT
+            pos = series.index.get_loc(t)
+            back = np.flatnonzero(vals[pos + 1:] >= vals[pos - 1])
+            if back.size:
+                n_low = back[0] + 1
+                end = series.index[pos + back[0]]
+                description = (
+                    f"Negative jump of {diff_val}; counter back at or above the "
+                    f"pre-drop reading after {n_low} low reading(s)."
+                )
+            else:
+                end = t
+                description = (
+                    f"Negative jump of {diff_val}; counter never gets back to the "
+                    f"pre-drop reading (likely a real restart)."
+                )
             suggestions.append({
                 "meter_name": meter,
                 "issue_type": "restart_or_drop",
-                "start_datetime": prev_idx,
-                "end_datetime": t,
-                "description": f"Negative jump of {diff_val}.",
+                "start_datetime": t,
+                "end_datetime": end,
+                "description": description,
                 "suggestion": "review_restart"
             })
 
@@ -2098,9 +2116,9 @@ def _plot_single_meter_review(
             )
 
             if issue_type == "restart_or_drop":
-                if pd.notna(end) and plot_start <= end <= plot_end:
+                if pd.notna(start) and plot_start <= start <= plot_end:
                     ax.axvline(
-                        end,
+                        start,
                         color="black",
                         linestyle="--",
                         linewidth=1.2,
