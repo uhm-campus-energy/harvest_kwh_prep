@@ -1798,19 +1798,34 @@ def get_review_plot_legend_handles(
         ])
 
     if include_removed:
-        handles.append(
+        handles.extend([
             Line2D(
                 [0],
                 [0],
-                color="orange",
+                color=REMOVED_POINT_COLOR,
                 marker="o",
                 linestyle="None",
                 markersize=6,
-                label="Removed raw reading",
-            )
-        )
+                label="Removed reading (broken list / approved correction)",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color=AUTO_FIX_REMOVED_POINT_COLOR,
+                marker="o",
+                linestyle="None",
+                markersize=6,
+                label="Removed reading (auto-fix: stuck run / recovered drop)",
+            ),
+        ])
 
     return handles
+
+
+# Removed-reading marker colors; auto-fix issue types skip review and have no span
+REMOVED_POINT_COLOR = "orange"
+AUTO_FIX_REMOVED_POINT_COLOR = "dimgray"
+AUTO_FIX_REMOVED_ISSUE_TYPES = {"stuck_run", "recovered_drop"}
 
 
 REPORT_RANGE_LINE_STYLE = dict(color="green", linestyle=":", linewidth=1.6)
@@ -2163,14 +2178,32 @@ def _plot_single_meter_review(
         ].copy()
 
         if not removed_plot.empty:
-            ax.scatter(
-                removed_plot["datetime"],
-                removed_plot["meter_reading"],
-                s=10,
-                alpha=0.8,
-                marker="o",
-                color="orange",
-            )
+            # color removed points by reason: auto-fixed (stuck run / recovered drop)
+            # vs. broken list or approved correction
+            if "issue_type/status" in removed_plot.columns:
+                is_auto_fix = (
+                    removed_plot["issue_type/status"]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .isin(AUTO_FIX_REMOVED_ISSUE_TYPES)
+                )
+            else:
+                is_auto_fix = pd.Series(False, index=removed_plot.index)
+
+            for mask, color in [
+                (~is_auto_fix, REMOVED_POINT_COLOR),
+                (is_auto_fix, AUTO_FIX_REMOVED_POINT_COLOR),
+            ]:
+                if mask.any():
+                    ax.scatter(
+                        removed_plot.loc[mask, "datetime"],
+                        removed_plot.loc[mask, "meter_reading"],
+                        s=10,
+                        alpha=0.8,
+                        marker="o",
+                        color=color,
+                    )
 
     annotation_lines = []
 
@@ -2487,7 +2520,9 @@ def plot_meter_maintenance_review_pdf(
             notes=[
                 "Every plot title identifies the meter as [main] or [submeter].",
                 "Red and blue intervals may overlap and appear purple.",
-                "Orange points preserve readings removed by an approved correction.",
+                "Orange points are readings removed by the broken list or an approved correction.",
+                "Gray points are readings auto-removed without review (stuck runs, recovered drops), so they have no span.",
+                "Zero readings are hidden (treated as missing, same as the main pipeline).",
             ],
         )
 
@@ -2613,12 +2648,12 @@ BROKEN_UPDATE_LOG_COLUMNS = [
     "source_end_date",
     "source_status",
     "source_description",
+    "data_source",
     "action",
     "new_start_date",
     "new_end_date",
     "new_status",
     "new_description",
-    "reason",
     "approved",
 ]
 
@@ -2679,21 +2714,306 @@ def _build_update_key(df):
     )
 
 
+BOUNDARY_CHECK_COLUMNS = [
+    "meter_name",
+    "source_start_date",
+    "source_end_date",
+    "source_status",
+    "source_description",
+    "check",
+    "suggested_start_date",
+    "suggested_end_date",
+    "detail",
+]
+
+
+def _good_reading_mask(series, min_flat_run):
+    """
+    Boolean array: True where a reading is usable.
+    A reading is not usable when it is NaN, or when it is part of a run of
+    identical consecutive values lasting at least min_flat_run (stuck meter).
+    """
+    notna = series.notna().to_numpy()
+    if len(series) < 2:
+        return notna
+
+    freq = series.index[1] - series.index[0]
+    run_id = (series != series.shift()).cumsum()
+    run_len = series.groupby(run_id).transform("size").to_numpy()
+    flat = notna & (run_len * freq >= min_flat_run)
+    return notna & ~flat
+
+
+def detect_broken_boundary_issues(
+    data,
+    broken_df,
+    meters=None,
+    min_boundary_gap="1D",
+    min_flat_run="1D",
+    min_good_fraction=0.9,
+):
+    """
+    Compare each broken-meter row's start/end dates with the meter's readings
+    and flag rows whose dates look wrong.
+
+    A reading is "bad" if it is NaN (0s should already be NaN) or part of a
+    flat run lasting at least min_flat_run. Checks per broken row:
+
+    - start_too_late: bad readings run up to the broken start for at least
+      min_boundary_gap -> suggest starting at the first bad reading
+    - start_too_early: good readings run from the broken start for at least
+      min_boundary_gap before the meter goes bad -> suggest starting later
+    - end_too_early: bad readings continue after the broken end for at least
+      min_boundary_gap -> suggest ending at the last bad reading
+      (if bad through the end of the data, no date is suggested; consider
+      making the row open-ended)
+    - end_too_late / data_resumed: good readings run up to the broken end
+      (or to the end of the data for open-ended rows) for at least
+      min_boundary_gap -> suggest ending at the last bad reading
+    - mostly_good_inside: at least min_good_fraction of the readings inside
+      the broken window are good -> the meter may not be broken (no date
+      suggested; review for remove)
+
+    Gaps that overlap another broken row of the same meter are not flagged.
+    Rows outside the data range, or with no start date, are skipped.
+
+    Returns a DataFrame with BOUNDARY_CHECK_COLUMNS. source_* values use the
+    same text format as the update log so rows can be matched to it.
+    """
+    min_boundary_gap = pd.Timedelta(min_boundary_gap)
+    min_flat_run = pd.Timedelta(min_flat_run)
+
+    data = data.sort_index()
+    if meters is not None:
+        meters = {_normalize_text(m) for m in meters}
+
+    rows = []
+
+    for meter_name, meter_rows in broken_df.groupby("meter_name"):
+        if meters is not None and meter_name not in meters:
+            continue
+        if meter_name not in data.columns:
+            continue
+
+        series = data[meter_name]
+        idx = series.index
+        if len(idx) < 2:
+            continue
+
+        freq = idx[1] - idx[0]
+        data_start, data_end = idx[0], idx[-1]
+        good = _good_reading_mask(series, min_flat_run)
+
+        for row_i, row in meter_rows.iterrows():
+            start = row["start_date"]
+            end = row["end_date"]
+            if pd.isna(start):
+                continue
+            open_ended = pd.isna(end)
+            if start > data_end or (not open_ended and end < data_start):
+                continue
+
+            # timestamps covered by this meter's other broken rows
+            covered_other = np.zeros(len(idx), dtype=bool)
+            for other_i, other in meter_rows.iterrows():
+                if other_i == row_i or pd.isna(other["start_date"]):
+                    continue
+                other_end = data_end if pd.isna(other["end_date"]) else other["end_date"]
+                covered_other |= (idx >= other["start_date"]) & (idx <= other_end)
+
+            base = {
+                "meter_name": meter_name,
+                "source_start_date": datetime_to_text(start),
+                "source_end_date": datetime_to_text(end),
+                "source_status": row["status"],
+                "source_description": row["description"],
+            }
+
+            def flag(check, detail, suggested_start=pd.NaT, suggested_end=pd.NaT):
+                rows.append({
+                    **base,
+                    "check": check,
+                    "suggested_start_date": datetime_to_text(suggested_start),
+                    "suggested_end_date": datetime_to_text(suggested_end),
+                    "detail": detail,
+                })
+
+            window_end = data_end if open_ended else min(end, data_end)
+            p = int(idx.searchsorted(start, side="left"))  # first ts >= start
+            pe = int(idx.searchsorted(window_end, side="right"))  # one past last ts in window
+            if p >= pe:
+                continue
+            window_good = good[p:pe]
+
+            # start_too_late: bad run right before the broken start
+            if p > 0 and not good[p - 1]:
+                good_before = np.flatnonzero(good[:p])
+                if len(good_before):  # skip if bad all the way back to the data start
+                    gap_start_pos = good_before[-1] + 1
+                    gap = idx[p] - idx[gap_start_pos]
+                    if gap >= min_boundary_gap and not covered_other[gap_start_pos:p].any():
+                        flag(
+                            "start_too_late",
+                            f"Readings are missing/flat from {datetime_to_text(idx[gap_start_pos])}, "
+                            f"{gap} before the broken start.",
+                            suggested_start=idx[gap_start_pos],
+                        )
+
+            # start_too_early: good run right after the broken start
+            if window_good[0]:
+                bad_after = np.flatnonzero(~window_good)
+                if len(bad_after):
+                    first_bad = idx[p + bad_after[0]]
+                    run = first_bad - idx[p]
+                    if run >= min_boundary_gap:
+                        flag(
+                            "start_too_early",
+                            f"Readings are good for {run} after the broken start; "
+                            f"first missing/flat reading is {datetime_to_text(first_bad)}.",
+                            suggested_start=first_bad,
+                        )
+
+            # end_too_early: bad run right after the broken end
+            if not open_ended and end < data_end:
+                q = int(idx.searchsorted(end, side="right"))  # first ts > end
+                if q < len(idx) and not good[q]:
+                    good_after = np.flatnonzero(good[q:])
+                    if len(good_after):
+                        last_bad_pos = q + good_after[0] - 1
+                        gap = idx[last_bad_pos] - idx[q] + freq
+                        if gap >= min_boundary_gap and not covered_other[q:last_bad_pos + 1].any():
+                            flag(
+                                "end_too_early",
+                                f"Readings stay missing/flat for {gap} after the broken end, "
+                                f"until {datetime_to_text(idx[last_bad_pos])}.",
+                                suggested_end=idx[last_bad_pos],
+                            )
+                    elif not covered_other[q:].any():
+                        flag(
+                            "end_too_early",
+                            "Readings stay missing/flat from the broken end through the end of the data; "
+                            "consider making the row open-ended (no date suggested).",
+                        )
+
+            # end_too_late / data_resumed: good run right before the end of the window
+            if window_good[-1]:
+                bad_inside = np.flatnonzero(~window_good)
+                if len(bad_inside):
+                    last_bad = idx[p + bad_inside[-1]]
+                    run = idx[pe - 1] - last_bad
+                    if run >= min_boundary_gap:
+                        if open_ended:
+                            flag(
+                                "data_resumed",
+                                f"Open-ended row, but readings are good from "
+                                f"{datetime_to_text(last_bad + freq)} to the end of the data ({run}).",
+                                suggested_end=last_bad,
+                            )
+                        else:
+                            flag(
+                                "end_too_late",
+                                f"Readings are good for {run} before the broken end; "
+                                f"last missing/flat reading is {datetime_to_text(last_bad)}.",
+                                suggested_end=last_bad,
+                            )
+
+            # mostly_good_inside: the meter may not be broken at all
+            good_fraction = float(window_good.mean())
+            if good_fraction >= min_good_fraction:
+                clipped = " (only the part inside the data range)" if start < data_start or window_end < (data_end if open_ended else end) else ""
+                flag(
+                    "mostly_good_inside",
+                    f"{good_fraction:.0%} of readings inside the broken window are good{clipped}; "
+                    "the meter may not be broken (review for remove).",
+                )
+
+    return pd.DataFrame(rows, columns=BOUNDARY_CHECK_COLUMNS)
+
+
+def _apply_boundary_suggestions(update_log_df, boundary_checks_df, meters):
+    """
+    Prefill action = update and new_start_date / new_end_date on update log
+    rows that match a boundary check suggestion. Only untouched rows
+    (blank action and new_* fields, approved = 0) of the given meters are
+    filled, so manual edits are never overwritten. approved stays 0.
+    """
+    if boundary_checks_df is None or boundary_checks_df.empty:
+        return update_log_df
+
+    suggestions = boundary_checks_df.copy()
+    suggestions["_key"] = _build_update_key(suggestions)
+
+    def single_value(values):
+        values = {v for v in values if isinstance(v, str) and v.strip() != ""}
+        # skip when two checks disagree on the same date
+        return values.pop() if len(values) == 1 else ""
+
+    per_key = suggestions.groupby("_key").agg(
+        new_start_date=("suggested_start_date", single_value),
+        new_end_date=("suggested_end_date", single_value),
+    )
+    per_key = per_key[(per_key["new_start_date"] != "") | (per_key["new_end_date"] != "")]
+    if per_key.empty:
+        return update_log_df
+
+    update_log_df = update_log_df.copy()
+    keys = _build_update_key(update_log_df)
+
+    def blank(col):
+        return update_log_df[col].fillna("").astype(str).str.strip().eq("")
+
+    untouched = (
+        blank("action") & blank("new_start_date") & blank("new_end_date")
+        & blank("new_status") & blank("new_description")
+        & pd.to_numeric(update_log_df["approved"], errors="coerce").fillna(0).eq(0)
+        & update_log_df["meter_name"].fillna("").astype(str).str.strip().str.lower().isin(meters)
+        & keys.isin(per_key.index)
+    )
+
+    for col in ["action", "new_start_date", "new_end_date"]:
+        update_log_df[col] = update_log_df[col].astype(object)
+
+    for i in update_log_df.index[untouched]:
+        s = per_key.loc[keys[i]]
+        update_log_df.at[i, "action"] = "update"
+        if s["new_start_date"]:
+            update_log_df.at[i, "new_start_date"] = s["new_start_date"]
+        if s["new_end_date"]:
+            update_log_df.at[i, "new_end_date"] = s["new_end_date"]
+
+    print(f"Prefilled {int(untouched.sum())} update log rows from boundary checks (approved left at 0).")
+    return update_log_df
+
+
 def prepare_broken_meter_update_log(
     update_log_file,
     broken_source_df,
     meters_to_review,
     refresh_selected_meters=True,
+    data_source="harvest",
+    boundary_checks_df=None,
 ):
     """
     Create/load the maintenance update log and refresh selected source rows.
+
+    data_source: source of the reviewed data, from the schema name
+    (e.g. schema 'aurora_v4' -> 'aurora'). Refreshed rows get this value;
+    approved update/add actions write it to the broken list's data_source.
+
+    boundary_checks_df: optional output of detect_broken_boundary_issues.
+    Untouched rows of the selected meters get action = update and the
+    suggested new_start_date / new_end_date prefilled (approved stays 0).
     """
+    data_source = _normalize_text(data_source)
     output_dir = os.path.dirname(str(update_log_file))
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
     if os.path.exists(update_log_file):
         update_log_df = pd.read_csv(update_log_file)
+        # older logs were created before the data_source column existed
+        if "data_source" not in update_log_df.columns:
+            update_log_df["data_source"] = ""
         missing_cols = [
             col
             for col in BROKEN_UPDATE_LOG_COLUMNS
@@ -2730,12 +3050,12 @@ def prepare_broken_meter_update_log(
                     "source_end_date": "",
                     "source_status": "",
                     "source_description": "",
+                    "data_source": data_source,
                     "action": "",
                     "new_start_date": "",
                     "new_end_date": "",
                     "new_status": "",
                     "new_description": "",
-                    "reason": "",
                     "approved": 0,
                 })
             else:
@@ -2746,12 +3066,12 @@ def prepare_broken_meter_update_log(
                         "source_end_date": datetime_to_text(row["end_date"]),
                         "source_status": str(row["status"]).strip(),
                         "source_description": str(row["description"]).strip(),
+                        "data_source": data_source,
                         "action": "",
                         "new_start_date": "",
                         "new_end_date": "",
                         "new_status": "",
                         "new_description": "",
-                        "reason": "",
                         "approved": 0,
                     })
 
@@ -2776,6 +3096,8 @@ def prepare_broken_meter_update_log(
             subset="_key",
             keep="first",
         )
+        # refreshed rows reflect the data reviewed in this run
+        combined_refresh_rows["data_source"] = data_source
         update_log_df = pd.concat(
             [preserved_other, combined_refresh_rows],
             ignore_index=True,
@@ -2792,6 +3114,14 @@ def prepare_broken_meter_update_log(
         .astype(int)
     )
     update_log_df = update_log_df[BROKEN_UPDATE_LOG_COLUMNS].copy()
+
+    # Prefill untouched rows of the selected meters with boundary check dates
+    update_log_df = _apply_boundary_suggestions(
+        update_log_df,
+        boundary_checks_df,
+        set(normalized_meters),
+    )
+
     update_log_df.to_csv(update_log_file, index=False)
     return update_log_df
 
@@ -2954,6 +3284,12 @@ def apply_broken_meter_update_actions(
                 else old_row["description"]
             )
 
+            new_data_source = (
+                _normalize_text(log_row.get("data_source", ""))
+                if _log_value_is_filled(log_row.get("data_source", ""))
+                else old_row["data_source"]
+            )
+
             if new_status not in BROKEN_STATUS_VALUES:
                 raise ValueError(
                     f"Invalid new_status for update on meter "
@@ -2965,6 +3301,7 @@ def apply_broken_meter_update_actions(
             reviewed_broken_df.loc[match_idx, "end_date"] = new_end
             reviewed_broken_df.loc[match_idx, "status"] = new_status
             reviewed_broken_df.loc[match_idx, "description"] = new_desc
+            reviewed_broken_df.loc[match_idx, "data_source"] = new_data_source
             reviewed_broken_df.loc[match_idx, "updated_data"] = now_ts
 
             applied_change_log.append({
@@ -3034,7 +3371,11 @@ def apply_broken_meter_update_actions(
                 "end_date": new_end,
                 "status": new_status,
                 "description": new_desc,
-                "data_source": "maintenance_update_log",
+                "data_source": (
+                    _normalize_text(log_row.get("data_source", ""))
+                    if _log_value_is_filled(log_row.get("data_source", ""))
+                    else "maintenance_update_log"
+                ),
                 "updated_data": now_ts,
             }])
             reviewed_broken_df = pd.concat([reviewed_broken_df, new_row], ignore_index=True, sort=False)
@@ -3164,7 +3505,8 @@ def get_calendar_month_periods(index, start_time, end_time):
     across periods telescopes back to the full-window raw difference.
 
     Returns a list of (month_label, period_start, period_end) tuples, where
-    month_label is the "YYYY-MM" of the period's start.
+    month_label is "YYYY-MM-01" (first of the period's month), since the
+    database needs a full date.
     """
     start_time = pd.to_datetime(start_time)
     end_time = pd.to_datetime(end_time)
@@ -3178,7 +3520,7 @@ def get_calendar_month_periods(index, start_time, end_time):
         resolved_start, resolved_end = resolve_analysis_window(index, seg_start, seg_end)
         if resolved_start == resolved_end:
             continue
-        label = resolved_start.strftime("%Y-%m")
+        label = resolved_start.strftime("%Y-%m-01")
         periods.append((label, resolved_start, resolved_end))
 
     return periods
@@ -3440,23 +3782,17 @@ def _compute_interp_window_differences(
             "end_time", "end",
             "raw_difference", "difference", "interpolated_kwh",
             "R²", "info",
-            "% interpolated", "% scaled",
+            "pct_interpolated", "pct_scaled",
         ],
     )
 
-    def format_percent(value, info):
-        if pd.isna(value):
-            return "N/A" if info != "" else ""
-        elif value == 0:
-            return ""
-        else:
-            return f"{value:.1f}%"
-
-    for col in ["% interpolated", "% scaled"]:
-        result_df[col] = [
-            format_percent(val, info)
-            for val, info in zip(result_df[col], result_df["info"])
-        ]
+    # Percent columns are stored as decimal fractions (0.123 = 12.3%) for the
+    # database: 0 when nothing was interpolated/scaled, NaN (blank in CSV)
+    # when kWh couldn't be calculated.
+    # 0 is stored as int so the CSV shows "0" instead of "0.0".
+    for col in ["pct_interpolated", "pct_scaled"]:
+        pct = (result_df[col].astype(float) / 100).round(3)
+        result_df[col] = pct.astype(object).where(pct != 0, 0)
 
     return result_df
 
@@ -3477,7 +3813,7 @@ def compute_meter_differences(
     gap) aren't bracketed by valid readings.
 
     Scaling requires at least valid_len intervals of covered time; meters
-    with less coverage are left NaN ("N/A"). Meters with fewer than valid_len
+    with less coverage are left NaN (blank). Meters with fewer than valid_len
     real readings inside start_time -> end_time are also left NaN, so a year
     interpolated mostly from readings outside it isn't reported.
 
@@ -3524,7 +3860,7 @@ def compute_monthly_meter_differences(
 
     A month is scaled only for time not bracketed by valid readings, and only
     if at least monthly_min_valid_fraction of the month is covered; months
-    with less coverage are left NaN ("N/A").
+    with less coverage are left NaN (blank).
 
     `data` can cover a wider data range than start_time -> end_time; readings
     outside the report range are used to interpolate across its edges.
@@ -3581,15 +3917,16 @@ def export_monthly_scaling_detail(monthly_df, filename):
     """
     Pivot long-format monthly meter differences (from
     compute_monthly_meter_differences) to one row per meter and one column
-    per month, with each cell holding that meter's "% scaled" value for
-    the month (e.g. "45%", "", or "N/A").
+    per month, with each cell holding that meter's pct_scaled value for
+    the month as a decimal fraction (e.g. 0.45 = 45%, 0 = not scaled,
+    blank = kWh couldn't be calculated).
     """
-    pivot_df = monthly_df.pivot(index='meter_name', columns='month', values='% scaled')
+    pivot_df = monthly_df.pivot(index='meter_name', columns='month', values='pct_scaled')
     pivot_df = pivot_df.rename_axis(columns=None).reset_index()
 
     pivot_df.to_csv(filename, index=False)
 
-    print(f"Monthly % scaled wide format file saved to {filename}")
+    print(f"Monthly pct_scaled wide format file saved to {filename}")
 
     return pivot_df
 
