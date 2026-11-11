@@ -2649,6 +2649,7 @@ BROKEN_UPDATE_LOG_COLUMNS = [
     "source_status",
     "source_description",
     "data_source",
+    "boundary_check",
     "action",
     "new_start_date",
     "new_end_date",
@@ -2744,13 +2745,23 @@ def _good_reading_mask(series, min_flat_run):
     return notna & ~flat
 
 
+def _true_runs(mask):
+    """Return (start_pos, end_pos) inclusive for each run of True values."""
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return []
+    padded = np.concatenate([[False], mask, [False]])
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(changes[0::2], changes[1::2] - 1))
+
+
 def detect_broken_boundary_issues(
     data,
     broken_df,
     meters=None,
     min_boundary_gap="1D",
     min_flat_run="1D",
-    min_good_fraction=0.9,
+    max_restarts=5,
 ):
     """
     Compare each broken-meter row's start/end dates with the meter's readings
@@ -2761,18 +2772,24 @@ def detect_broken_boundary_issues(
 
     - start_too_late: bad readings run up to the broken start for at least
       min_boundary_gap -> suggest starting at the first bad reading
-    - start_too_early: good readings run from the broken start for at least
-      min_boundary_gap before the meter goes bad -> suggest starting later
+    - start_too_early: readings are good for at least min_boundary_gap after
+      the broken start before the first sustained bad run (a bad run lasting
+      at least min_boundary_gap) -> suggest starting at that run
     - end_too_early: bad readings continue after the broken end for at least
       min_boundary_gap -> suggest ending at the last bad reading
       (if bad through the end of the data, no date is suggested; consider
       making the row open-ended)
-    - end_too_late / data_resumed: good readings run up to the broken end
-      (or to the end of the data for open-ended rows) for at least
-      min_boundary_gap -> suggest ending at the last bad reading
-    - mostly_good_inside: at least min_good_fraction of the readings inside
-      the broken window are good -> the meter may not be broken (no date
-      suggested; review for remove)
+    - end_too_late / data_resumed: readings are good for at least
+      min_boundary_gap after the last sustained bad run, up to the broken end
+      (or the end of the data for open-ended rows) -> suggest ending at the
+      last bad reading of that run
+    - rows that start before / end after the data are still flagged, but no
+      date is suggested since the data can't show the earlier/later history
+
+    Meters with at least max_restarts restarts/drops (the cumulative reading
+    going down) across all of data are skipped: their readings restart too
+    often to be trusted as good, so boundary suggestions would be wrong.
+    The skipped meters are printed.
 
     Gaps that overlap another broken row of the same meter are not flagged.
     Rows outside the data range, or with no start date, are skipped.
@@ -2788,11 +2805,17 @@ def detect_broken_boundary_issues(
         meters = {_normalize_text(m) for m in meters}
 
     rows = []
+    skipped_restart_meters = {}
 
     for meter_name, meter_rows in broken_df.groupby("meter_name"):
         if meters is not None and meter_name not in meters:
             continue
         if meter_name not in data.columns:
+            continue
+
+        n_restarts = int((data[meter_name].dropna().diff() < 0).sum())
+        if max_restarts is not None and n_restarts >= max_restarts:
+            skipped_restart_meters[meter_name] = n_restarts
             continue
 
         series = data[meter_name]
@@ -2859,17 +2882,33 @@ def detect_broken_boundary_issues(
                             suggested_start=idx[gap_start_pos],
                         )
 
-            # start_too_early: good run right after the broken start
-            if window_good[0]:
-                bad_after = np.flatnonzero(~window_good)
-                if len(bad_after):
-                    first_bad = idx[p + bad_after[0]]
-                    run = first_bad - idx[p]
-                    if run >= min_boundary_gap:
+            # sustained bad runs inside the window (short blips are ignored)
+            bad_runs = [
+                (run_start, run_end)
+                for run_start, run_end in _true_runs(~window_good)
+                if (run_end - run_start + 1) * freq >= min_boundary_gap
+            ]
+
+            # start_too_early: good readings from the broken start until the
+            # first sustained bad run
+            if bad_runs:
+                first_bad = idx[p + bad_runs[0][0]]
+                run = first_bad - idx[p]
+                if run >= min_boundary_gap:
+                    if start < data_start:
+                        # the row starts before the data, so the earlier
+                        # history can't be checked; flag without a date
                         flag(
                             "start_too_early",
-                            f"Readings are good for {run} after the broken start; "
-                            f"first missing/flat reading is {datetime_to_text(first_bad)}.",
+                            f"Row starts before the data ({datetime_to_text(data_start)}); readings are good "
+                            f"for {run} from the data start, first sustained missing/flat reading is "
+                            f"{datetime_to_text(first_bad)}. No date suggested.",
+                        )
+                    else:
+                        flag(
+                            "start_too_early",
+                            f"Readings are good for {run} after the broken start; first sustained "
+                            f"missing/flat reading is {datetime_to_text(first_bad)}.",
                             suggested_start=first_bad,
                         )
 
@@ -2895,48 +2934,66 @@ def detect_broken_boundary_issues(
                             "consider making the row open-ended (no date suggested).",
                         )
 
-            # end_too_late / data_resumed: good run right before the end of the window
-            if window_good[-1]:
-                bad_inside = np.flatnonzero(~window_good)
-                if len(bad_inside):
-                    last_bad = idx[p + bad_inside[-1]]
-                    run = idx[pe - 1] - last_bad
-                    if run >= min_boundary_gap:
-                        if open_ended:
-                            flag(
-                                "data_resumed",
-                                f"Open-ended row, but readings are good from "
-                                f"{datetime_to_text(last_bad + freq)} to the end of the data ({run}).",
-                                suggested_end=last_bad,
-                            )
-                        else:
-                            flag(
-                                "end_too_late",
-                                f"Readings are good for {run} before the broken end; "
-                                f"last missing/flat reading is {datetime_to_text(last_bad)}.",
-                                suggested_end=last_bad,
-                            )
+            # end_too_late / data_resumed: good readings after the last
+            # sustained bad run until the end of the window
+            if bad_runs:
+                last_bad = idx[p + bad_runs[-1][1]]
+                run = idx[pe - 1] - last_bad
+                if run >= min_boundary_gap:
+                    if open_ended:
+                        flag(
+                            "data_resumed",
+                            f"Open-ended row, but readings are good from "
+                            f"{datetime_to_text(last_bad + freq)} to the end of the data ({run}).",
+                            suggested_end=last_bad,
+                        )
+                    elif end > data_end:
+                        flag(
+                            "end_too_late",
+                            f"Row ends after the data ({datetime_to_text(data_end)}); readings are good "
+                            f"for {run} before the data end, last sustained missing/flat reading is "
+                            f"{datetime_to_text(last_bad)}. No date suggested.",
+                        )
+                    else:
+                        flag(
+                            "end_too_late",
+                            f"Readings are good for {run} before the broken end; last sustained "
+                            f"missing/flat reading is {datetime_to_text(last_bad)}.",
+                            suggested_end=last_bad,
+                        )
 
-            # mostly_good_inside: the meter may not be broken at all
-            good_fraction = float(window_good.mean())
-            if good_fraction >= min_good_fraction:
-                clipped = " (only the part inside the data range)" if start < data_start or window_end < (data_end if open_ended else end) else ""
-                flag(
-                    "mostly_good_inside",
-                    f"{good_fraction:.0%} of readings inside the broken window are good{clipped}; "
-                    "the meter may not be broken (review for remove).",
-                )
+    if skipped_restart_meters:
+        print(
+            f"Boundary checks skipped {len(skipped_restart_meters)} meters with "
+            f">= {max_restarts} restarts in the data:"
+        )
+        for meter_name, n in sorted(skipped_restart_meters.items(), key=lambda kv: -kv[1]):
+            print(f"  {meter_name}: {n} restarts")
 
     return pd.DataFrame(rows, columns=BOUNDARY_CHECK_COLUMNS)
 
 
 def _apply_boundary_suggestions(update_log_df, boundary_checks_df, meters):
     """
-    Prefill action = update and new_start_date / new_end_date on update log
-    rows that match a boundary check suggestion. Only untouched rows
-    (blank action and new_* fields, approved = 0) of the given meters are
-    filled, so manual edits are never overwritten. approved stays 0.
+    Write boundary check results into the update log for the given meters.
+
+    - boundary_check: always refreshed with the names of the checks that
+      flagged that source row, e.g. "start_too_early, end_too_late"
+      (blank when nothing was flagged). One log row per source row, since
+      an update must match exactly one broken-list row
+    - action / new_start_date / new_end_date: filled with the suggested
+      dates only on untouched rows (blank action and new_* fields,
+      approved = 0), so manual edits are never overwritten. approved stays 0.
+      When two flags suggest different dates for the same field, that field
+      is left blank.
     """
+    update_log_df = update_log_df.copy()
+    is_selected = (
+        update_log_df["meter_name"].fillna("").astype(str).str.strip().str.lower().isin(meters)
+    )
+    update_log_df["boundary_check"] = update_log_df["boundary_check"].astype(object)
+    update_log_df.loc[is_selected, "boundary_check"] = ""
+
     if boundary_checks_df is None or boundary_checks_df.empty:
         return update_log_df
 
@@ -2945,43 +3002,46 @@ def _apply_boundary_suggestions(update_log_df, boundary_checks_df, meters):
 
     def single_value(values):
         values = {v for v in values if isinstance(v, str) and v.strip() != ""}
-        # skip when two checks disagree on the same date
         return values.pop() if len(values) == 1 else ""
 
     per_key = suggestions.groupby("_key").agg(
         new_start_date=("suggested_start_date", single_value),
         new_end_date=("suggested_end_date", single_value),
+        boundary_check=("check", lambda c: ", ".join(dict.fromkeys(c))),
     )
-    per_key = per_key[(per_key["new_start_date"] != "") | (per_key["new_end_date"] != "")]
-    if per_key.empty:
-        return update_log_df
 
-    update_log_df = update_log_df.copy()
     keys = _build_update_key(update_log_df)
+    matched = is_selected & keys.isin(per_key.index)
 
     def blank(col):
         return update_log_df[col].fillna("").astype(str).str.strip().eq("")
 
     untouched = (
-        blank("action") & blank("new_start_date") & blank("new_end_date")
+        matched
+        & blank("action") & blank("new_start_date") & blank("new_end_date")
         & blank("new_status") & blank("new_description")
         & pd.to_numeric(update_log_df["approved"], errors="coerce").fillna(0).eq(0)
-        & update_log_df["meter_name"].fillna("").astype(str).str.strip().str.lower().isin(meters)
-        & keys.isin(per_key.index)
     )
 
     for col in ["action", "new_start_date", "new_end_date"]:
         update_log_df[col] = update_log_df[col].astype(object)
 
-    for i in update_log_df.index[untouched]:
+    prefilled = 0
+    for i in update_log_df.index[matched]:
         s = per_key.loc[keys[i]]
-        update_log_df.at[i, "action"] = "update"
-        if s["new_start_date"]:
-            update_log_df.at[i, "new_start_date"] = s["new_start_date"]
-        if s["new_end_date"]:
-            update_log_df.at[i, "new_end_date"] = s["new_end_date"]
+        update_log_df.at[i, "boundary_check"] = s["boundary_check"]
+        if untouched[i] and (s["new_start_date"] or s["new_end_date"]):
+            update_log_df.at[i, "action"] = "update"
+            if s["new_start_date"]:
+                update_log_df.at[i, "new_start_date"] = s["new_start_date"]
+            if s["new_end_date"]:
+                update_log_df.at[i, "new_end_date"] = s["new_end_date"]
+            prefilled += 1
 
-    print(f"Prefilled {int(untouched.sum())} update log rows from boundary checks (approved left at 0).")
+    print(
+        f"Boundary checks: {int(matched.sum())} update log rows flagged, "
+        f"{prefilled} prefilled with suggested dates (approved left at 0)."
+    )
     return update_log_df
 
 
@@ -3001,8 +3061,9 @@ def prepare_broken_meter_update_log(
     approved update/add actions write it to the broken list's data_source.
 
     boundary_checks_df: optional output of detect_broken_boundary_issues.
-    Untouched rows of the selected meters get action = update and the
-    suggested new_start_date / new_end_date prefilled (approved stays 0).
+    The selected meters' rows get the explanation in boundary_check, and
+    untouched rows get action = update with the suggested new_start_date /
+    new_end_date prefilled (approved stays 0).
     """
     data_source = _normalize_text(data_source)
     output_dir = os.path.dirname(str(update_log_file))
@@ -3014,6 +3075,8 @@ def prepare_broken_meter_update_log(
         # older logs were created before the data_source column existed
         if "data_source" not in update_log_df.columns:
             update_log_df["data_source"] = ""
+        if "boundary_check" not in update_log_df.columns:
+            update_log_df["boundary_check"] = ""
         missing_cols = [
             col
             for col in BROKEN_UPDATE_LOG_COLUMNS
@@ -3051,6 +3114,7 @@ def prepare_broken_meter_update_log(
                     "source_status": "",
                     "source_description": "",
                     "data_source": data_source,
+                    "boundary_check": "",
                     "action": "",
                     "new_start_date": "",
                     "new_end_date": "",
@@ -3067,6 +3131,7 @@ def prepare_broken_meter_update_log(
                         "source_status": str(row["status"]).strip(),
                         "source_description": str(row["description"]).strip(),
                         "data_source": data_source,
+                        "boundary_check": "",
                         "action": "",
                         "new_start_date": "",
                         "new_end_date": "",
