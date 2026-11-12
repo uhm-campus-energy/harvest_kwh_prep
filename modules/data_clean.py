@@ -1761,8 +1761,16 @@ def update_special_meter_candidates_workbook(
 def get_review_plot_legend_handles(
     include_candidates=True,
     include_removed=False,
+    include_boundary=False,
+    include_restarts=None,
 ):
-    """Return consistent legend entries for endpoint and maintenance PDFs."""
+    """
+    Return consistent legend entries for endpoint and maintenance PDFs.
+    include_restarts defaults to include_candidates (restart lines come from
+    the candidate file in the endpoint PDFs, from the readings in maintenance).
+    """
+    if include_restarts is None:
+        include_restarts = include_candidates
     handles = [
         Line2D(
             [0],
@@ -1780,13 +1788,16 @@ def get_review_plot_legend_handles(
     ]
 
     if include_candidates:
-        handles.extend([
+        handles.append(
             Patch(
                 facecolor="blue",
                 edgecolor="blue",
                 alpha=0.20,
                 label="Candidate issue interval",
-            ),
+            )
+        )
+    if include_restarts:
+        handles.append(
             Line2D(
                 [0],
                 [0],
@@ -1794,8 +1805,8 @@ def get_review_plot_legend_handles(
                 linestyle="--",
                 linewidth=1.2,
                 label="Restart / drop event",
-            ),
-        ])
+            )
+        )
 
     if include_removed:
         handles.extend([
@@ -1819,8 +1830,30 @@ def get_review_plot_legend_handles(
             ),
         ])
 
+    if include_boundary:
+        handles.extend([
+            Patch(
+                facecolor="none",
+                edgecolor=BOUNDARY_COLOR,
+                hatch=BOUNDARY_HATCH,
+                label="Boundary fix: change between current and suggested date",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color=BOUNDARY_COLOR,
+                linestyle="--",
+                linewidth=1.4,
+                label="Boundary fix: suggested start / end date",
+            ),
+        ])
+
     return handles
 
+
+# Boundary check overlay style (maintenance review PDF)
+BOUNDARY_COLOR = "magenta"
+BOUNDARY_HATCH = "///"
 
 # Removed-reading marker colors; auto-fix issue types skip review and have no span
 REMOVED_POINT_COLOR = "orange"
@@ -1953,6 +1986,7 @@ def _plot_single_meter_review(
     footer_note="",
     report_start=None,
     report_end=None,
+    boundary_df=None,
 ):
     """
     Draw one review meter graph.
@@ -1960,6 +1994,10 @@ def _plot_single_meter_review(
     This is the shared plotting engine used by endpoint review PDFs,
     maintenance review PDFs, and approved change preview PDFs.
     report_start / report_end (optional) draw vertical report range lines.
+    boundary_df (optional): output of detect_broken_boundary_issues. Draws a
+    hatched band from each current broken boundary to its suggested date, a
+    dashed line + label at the suggested date, and adds the check names to
+    the "Issue type" line.
     """
     if data is None or data.empty:
         raise ValueError("data is empty.")
@@ -2159,6 +2197,56 @@ def _plot_single_meter_review(
                         alpha=0.20,
                     )
 
+    meter_boundary = pd.DataFrame()
+    if boundary_df is not None and not boundary_df.empty:
+        meter_boundary = boundary_df[
+            boundary_df["meter_name"].fillna("").astype(str).str.strip().str.lower().eq(meter_name_norm)
+        ]
+
+    for _, row in meter_boundary.iterrows():
+        for side in ("start", "end"):
+            suggested = pd.to_datetime(row.get(f"suggested_{side}_date", ""), errors="coerce")
+            if pd.isna(suggested):
+                continue
+            current = pd.to_datetime(row.get(f"source_{side}_date", ""), errors="coerce")
+            if pd.isna(current):
+                # open-ended row: the change runs to the end of the plot
+                current = plot_end
+
+            band_start = max(min(current, suggested), plot_start)
+            band_end = min(max(current, suggested), plot_end)
+            if band_start < band_end:
+                ax.axvspan(
+                    band_start,
+                    band_end,
+                    facecolor="none",
+                    edgecolor=BOUNDARY_COLOR,
+                    hatch=BOUNDARY_HATCH,
+                    linewidth=0,
+                    alpha=0.6,
+                )
+
+            if plot_start <= suggested <= plot_end:
+                ax.axvline(
+                    suggested,
+                    color=BOUNDARY_COLOR,
+                    linestyle="--",
+                    linewidth=1.4,
+                    alpha=0.9,
+                )
+                ax.text(
+                    suggested,
+                    0.97,
+                    f" {row['check']} → {suggested.month}/{suggested.day}/{suggested.year}",
+                    transform=ax.get_xaxis_transform(),
+                    ha="left" if side == "start" else "right",
+                    va="top",
+                    rotation=90,
+                    fontsize=8,
+                    color=BOUNDARY_COLOR,
+                    clip_on=True,
+                )
+
     removed_plot = pd.DataFrame()
     if (
         not meter_removed.empty
@@ -2218,15 +2306,19 @@ def _plot_single_meter_review(
                 "Broken status: " + ", ".join(status_values)
             )
 
-    if (
-        "issue_type" in annotation_fields
-        and "issue_type" in meter_candidates.columns
-    ):
-        issue_types = [
-            str(value).strip()
-            for value in pd.unique(meter_candidates["issue_type"].dropna())
-            if str(value).strip() != ""
-        ]
+    if "issue_type" in annotation_fields:
+        issue_types = []
+        if "issue_type" in meter_candidates.columns:
+            issue_types = [
+                str(value).strip()
+                for value in pd.unique(meter_candidates["issue_type"].dropna())
+                if str(value).strip() != ""
+            ]
+        if not meter_boundary.empty:
+            issue_types += [
+                check for check in pd.unique(meter_boundary["check"])
+                if check not in issue_types
+            ]
         if issue_types:
             label = (
                 "Issue type: "
@@ -2472,12 +2564,35 @@ def plot_review_meters_with_overlays(
     return saved_count
 
 
+def find_restart_events(data, meters=None):
+    """
+    Every restart / drop (the cumulative reading going down) in data, with no
+    cap per meter and including drops inside broken periods. Same counting as
+    the boundary check's restart count.
+
+    Returns a DataFrame shaped like restart candidate rows (meter_name,
+    issue_type = "restart_or_drop", start_datetime, end_datetime) so the
+    shared plot function draws each one as a black dashed line.
+    """
+    meters = data.columns if meters is None else [m for m in meters if m in data.columns]
+    rows = []
+    for meter_name in meters:
+        valid = data[meter_name].dropna()
+        for t in valid.index[(valid.diff() < 0).to_numpy()]:
+            rows.append({
+                "meter_name": meter_name,
+                "issue_type": "restart_or_drop",
+                "start_datetime": t,
+                "end_datetime": t,
+            })
+    return pd.DataFrame(rows, columns=["meter_name", "issue_type", "start_datetime", "end_datetime"])
+
+
 # meter maintenance ploting:
 def plot_meter_maintenance_review_pdf(
     data,
     meters_to_review,
     broken_df,
-    candidate_df,
     removed_df,
     plot_file,
     meter_type_map=None,
@@ -2485,11 +2600,15 @@ def plot_meter_maintenance_review_pdf(
     zoom_end=None,
     ylabel="kWh",
     show_plots=False,
+    boundary_df=None,
 ):
     """
     Create the selected meter maintenance review PDF using the shared meter plot function
-    with red broken meter overlays and blue candidate overlays, and also 
-    orange data markers for removed meter data.
+    with red broken meter overlays, orange/gray removed reading markers
+    (from the main pipeline's removed_special_meter_data.csv), black dashed
+    restart lines found directly in data (every restart, including inside
+    broken periods; the candidate file is not used), and the magenta boundary
+    fix overlay from boundary_df (output of detect_broken_boundary_issues).
     """
     meters_to_review = [
         str(meter).strip().lower()
@@ -2510,8 +2629,10 @@ def plot_meter_maintenance_review_pdf(
             pdf=pdf,
             title="Meter Maintenance Review Plots",
             handles=get_review_plot_legend_handles(
-                include_candidates=True,
+                include_candidates=False,
+                include_restarts=True,
                 include_removed=True,
+                include_boundary=True,
             ),
             description=(
                 "These plots show raw readings for selected main meters and "
@@ -2519,19 +2640,23 @@ def plot_meter_maintenance_review_pdf(
             ),
             notes=[
                 "Every plot title identifies the meter as [main] or [submeter].",
-                "Red and blue intervals may overlap and appear purple.",
+                "Restart lines are found from the readings shown, including restarts inside broken periods.",
+                "Magenta boundary fixes show where a broken row's dates don't match the readings.",
+                "Boundary check names (e.g. start_too_late) are listed on the Issue type line and in the update log's boundary_check column.",
                 "Orange points are readings removed by the broken list or an approved correction.",
                 "Gray points are readings auto-removed without review (stuck runs, recovered drops), so they have no span.",
                 "Zero readings are hidden (treated as missing, same as the main pipeline).",
             ],
         )
 
+        restart_df = find_restart_events(data, meters_to_review)
+
         for meter_name in meters_to_review:
             fig = _plot_single_meter_review(
                 meter_name=meter_name,
                 data=data,
                 broken_df=broken_df,
-                candidate_df=candidate_df,
+                candidate_df=restart_df,
                 removed_df=removed_df,
                 meter_type_map=meter_type_map,
                 zoom_start=zoom_start,
@@ -2539,9 +2664,11 @@ def plot_meter_maintenance_review_pdf(
                 ylabel=ylabel,
                 annotation_fields=(
                     "status",
+                    "broken_dates",
                     "issue_type",
                     "removed_count",
                 ),
+                boundary_df=boundary_df,
             )
             if fig is None:
                 continue
@@ -2786,8 +2913,9 @@ def detect_broken_boundary_issues(
     - rows that start before / end after the data are still flagged, but no
       date is suggested since the data can't show the earlier/later history
 
-    Meters with at least max_restarts restarts/drops (the cumulative reading
-    going down) across all of data are skipped: their readings restart too
+    Meters with more than max_restarts restarts/drops (the cumulative reading
+    going down) across all of data are skipped (same rule as restarts_thres
+    in 1.kwh_end_points): their readings restart too
     often to be trusted as good, so boundary suggestions would be wrong.
     The skipped meters are printed.
 
@@ -2814,7 +2942,7 @@ def detect_broken_boundary_issues(
             continue
 
         n_restarts = int((data[meter_name].dropna().diff() < 0).sum())
-        if max_restarts is not None and n_restarts >= max_restarts:
+        if max_restarts is not None and n_restarts > max_restarts:
             skipped_restart_meters[meter_name] = n_restarts
             continue
 
@@ -2965,7 +3093,7 @@ def detect_broken_boundary_issues(
     if skipped_restart_meters:
         print(
             f"Boundary checks skipped {len(skipped_restart_meters)} meters with "
-            f">= {max_restarts} restarts in the data:"
+            f"more than {max_restarts} restarts in the data:"
         )
         for meter_name, n in sorted(skipped_restart_meters.items(), key=lambda kv: -kv[1]):
             print(f"  {meter_name}: {n} restarts")
