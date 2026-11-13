@@ -2242,8 +2242,8 @@ def _plot_single_meter_review(
                     ha="left" if side == "start" else "right",
                     va="top",
                     rotation=90,
-                    fontsize=8,
-                    color=BOUNDARY_COLOR,
+                    fontsize=11,
+                    color="black",
                     clip_on=True,
                 )
 
@@ -2313,11 +2313,6 @@ def _plot_single_meter_review(
                 str(value).strip()
                 for value in pd.unique(meter_candidates["issue_type"].dropna())
                 if str(value).strip() != ""
-            ]
-        if not meter_boundary.empty:
-            issue_types += [
-                check for check in pd.unique(meter_boundary["check"])
-                if check not in issue_types
             ]
         if issue_types:
             label = (
@@ -2642,7 +2637,7 @@ def plot_meter_maintenance_review_pdf(
                 "Every plot title identifies the meter as [main] or [submeter].",
                 "Restart lines are found from the readings shown, including restarts inside broken periods.",
                 "Magenta boundary fixes show where a broken row's dates don't match the readings.",
-                "Boundary check names (e.g. start_too_late) are listed on the Issue type line and in the update log's boundary_check column.",
+                "Boundary check names (e.g. start_too_late) are labeled on the dashed line and listed in the update log's boundary_check column.",
                 "Orange points are readings removed by the broken list or an approved correction.",
                 "Gray points are readings auto-removed without review (stuck runs, recovered drops), so they have no span.",
                 "Zero readings are hidden (treated as missing, same as the main pipeline).",
