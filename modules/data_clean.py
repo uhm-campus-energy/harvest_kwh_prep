@@ -1763,6 +1763,7 @@ def get_review_plot_legend_handles(
     include_removed=False,
     include_boundary=False,
     include_restarts=None,
+    include_gaps=False,
 ):
     """
     Return consistent legend entries for endpoint and maintenance PDFs.
@@ -1848,12 +1849,25 @@ def get_review_plot_legend_handles(
             ),
         ])
 
+    if include_gaps:
+        handles.append(
+            Patch(
+                facecolor=DATA_GAP_COLOR,
+                edgecolor=DATA_GAP_COLOR,
+                alpha=0.20,
+                label="Data gap candidate (long stretch of missing readings)",
+            )
+        )
+
     return handles
 
 
 # Boundary check overlay style (maintenance review PDF)
 BOUNDARY_COLOR = "magenta"
 BOUNDARY_HATCH = "///"
+
+# Data gap candidate overlay (maintenance review PDF)
+DATA_GAP_COLOR = "purple"
 
 # Removed-reading marker colors; auto-fix issue types skip review and have no span
 REMOVED_POINT_COLOR = "orange"
@@ -2177,6 +2191,33 @@ def _plot_single_meter_review(
                         linewidth=1.2,
                         alpha=0.9,
                     )
+            elif issue_type == "data_gap" and pd.notna(start):
+                # open-ended gaps run to the end of the plot
+                raw_end = end
+                start = max(start, plot_start)
+                end = plot_end if pd.isna(end) else min(end, plot_end)
+                if start <= end:
+                    ax.axvspan(
+                        start,
+                        end,
+                        facecolor=DATA_GAP_COLOR,
+                        edgecolor=DATA_GAP_COLOR,
+                        alpha=0.20,
+                    )
+                    end_text = "" if pd.isna(raw_end) else f"{raw_end.month}/{raw_end.day}/{raw_end.year}"
+                    narrow = (end - start) < (plot_end - plot_start) * 0.12
+                    ax.text(
+                        start + (end - start) / 2 if narrow else start,
+                        0.03,
+                        f"gap {start.month}/{start.day}/{start.year} – {end_text}".strip(),
+                        transform=ax.get_xaxis_transform(),
+                        ha="center" if narrow else "left",
+                        va="bottom",
+                        rotation=90 if narrow else 0,
+                        fontsize=8,
+                        color=DATA_GAP_COLOR,
+                        clip_on=True,
+                    )
             elif pd.notna(start) and pd.notna(end):
                 start = max(start, plot_start)
                 end = min(end, plot_end)
@@ -2405,7 +2446,7 @@ def plot_all_meters_to_pdf(
     data_end = pd.to_datetime(data.index.max())
     saved_count = 0
 
-    with PdfPages(plot_file) as pdf:
+    with _buffered_pdf_pages(plot_file) as pdf:
         all_meter_legend_handles = [
             Line2D(
                 [0],
@@ -2517,7 +2558,7 @@ def plot_review_meters_with_overlays(
         review_handles.append(_report_range_legend_handle())
 
     saved_count = 0
-    with PdfPages(plot_file) as pdf:
+    with _buffered_pdf_pages(plot_file) as pdf:
         _add_pdf_legend_page(
             pdf=pdf,
             title="Review Meter Plots",
@@ -2594,8 +2635,9 @@ def plot_meter_maintenance_review_pdf(
     zoom_start=None,
     zoom_end=None,
     ylabel="kWh",
-    show_plots=False,
+    # show_plots=False,
     boundary_df=None,
+    gap_df=None,
 ):
     """
     Create the selected meter maintenance review PDF using the shared meter plot function
@@ -2604,13 +2646,19 @@ def plot_meter_maintenance_review_pdf(
     restart lines found directly in data (every restart, including inside
     broken periods; the candidate file is not used), and the magenta boundary
     fix overlay from boundary_df (output of detect_broken_boundary_issues).
+
+    gap_df (optional): output of detect_data_gaps. After the broken meter
+    pages, a "Data gap candidates" section has one page per meter with a gap,
+    in the same order as the gap rows of the update log. A broken meter with
+    a gap outside its broken rows is plotted again there.
     """
     meters_to_review = [
         str(meter).strip().lower()
         for meter in (meters_to_review or [])
         if str(meter).strip() != ""
     ]
-    if not meters_to_review:
+    has_gaps = gap_df is not None and not gap_df.empty
+    if not meters_to_review and not has_gaps:
         print("No selected main or submeter review meters were found.")
         return 0
 
@@ -2618,8 +2666,17 @@ def plot_meter_maintenance_review_pdf(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    review_fields = ("status", "broken_dates", "issue_type", "removed_count")
+
+    def save(fig):
+        pdf.savefig(fig, bbox_inches="tight")
+        # if show_plots:
+        #     plt.show()
+        plt.close(fig)
+
     saved_count = 0
-    with PdfPages(plot_file) as pdf:
+    gap_saved_count = 0
+    with _buffered_pdf_pages(plot_file) as pdf:
         _add_pdf_legend_page(
             pdf=pdf,
             title="Meter Maintenance Review Plots",
@@ -2657,25 +2714,74 @@ def plot_meter_maintenance_review_pdf(
                 zoom_start=zoom_start,
                 zoom_end=zoom_end,
                 ylabel=ylabel,
-                annotation_fields=(
-                    "status",
-                    "broken_dates",
-                    "issue_type",
-                    "removed_count",
-                ),
+                annotation_fields=review_fields,
                 boundary_df=boundary_df,
             )
             if fig is None:
                 continue
-            pdf.savefig(fig, bbox_inches="tight")
-            if show_plots:
-                plt.show()
-            plt.close(fig)
+            save(fig)
             saved_count += 1
 
-    if saved_count:
-        print(f"Saved maintenance review plots to {plot_file}")
-    return saved_count
+        if has_gaps:
+            gap_meters = list(dict.fromkeys(gap_df["meter_name"]))
+            _add_pdf_legend_page(
+                pdf=pdf,
+                title="Data Gap Candidates",
+                handles=get_review_plot_legend_handles(
+                    include_candidates=False,
+                    include_restarts=True,
+                    include_removed=True,
+                    include_gaps=True,
+                ),
+                description=(
+                    f"{len(gap_df)} gaps on {len(gap_meters)} meters: long stretches of missing "
+                    "readings that are not on the broken list."
+                ),
+                notes=[
+                    "Pages are in the same order as the gap rows at the end of the update log.",
+                    "Gaps already covered by a broken list row are not shown here.",
+                    "A meter can appear twice: once above for its broken rows, and here for a gap outside them.",
+                    "\"same gap on N other meters\" in new_description usually means a data-source outage, not a broken meter.",
+                ],
+            )
+
+            gap_candidates = pd.DataFrame({
+                "meter_name": gap_df["meter_name"],
+                "issue_type": "data_gap",
+                "start_datetime": gap_df["gap_start"],
+                "end_datetime": gap_df["gap_end"],
+            })
+            gap_candidate_df = pd.concat(
+                [find_restart_events(data, gap_meters), gap_candidates],
+                ignore_index=True,
+            )
+
+            for meter_name in gap_meters:
+                fig = _plot_single_meter_review(
+                    meter_name=meter_name,
+                    data=data,
+                    broken_df=broken_df,
+                    candidate_df=gap_candidate_df,
+                    removed_df=removed_df,
+                    meter_type_map=meter_type_map,
+                    zoom_start=zoom_start,
+                    zoom_end=zoom_end,
+                    ylabel=ylabel,
+                    annotation_fields=review_fields,
+                    title_suffix=" — data gap candidate",
+                )
+                if fig is None:
+                    continue
+                save(fig)
+                gap_saved_count += 1
+
+    if saved_count or gap_saved_count:
+        print(
+            f"Saved {saved_count} broken meter plots"
+            + (f" and {gap_saved_count} data gap plots" if gap_saved_count else "")
+            + f" to {plot_file}"
+        )
+    return saved_count + gap_saved_count
 
 
 def plot_approved_maintenance_preview_pdf(
@@ -2706,7 +2812,7 @@ def plot_approved_maintenance_preview_pdf(
         os.makedirs(output_dir, exist_ok=True)
 
     saved_count = 0
-    with PdfPages(plot_file) as pdf:
+    with _buffered_pdf_pages(plot_file) as pdf:
         _add_pdf_legend_page(
             pdf=pdf,
             title="Approved Maintenance Changes Preview",
@@ -3096,6 +3202,267 @@ def detect_broken_boundary_issues(
     return pd.DataFrame(rows, columns=BOUNDARY_CHECK_COLUMNS)
 
 
+DATA_GAP_COLUMNS = [
+    "meter_name",
+    "gap_start",
+    "gap_end",
+    "gap_days",
+    "missing_pct",
+    "gap_type",
+    "in_broken_list",
+    "shared_meters",
+]
+
+
+def detect_data_gaps(
+    data,
+    broken_df=None,
+    meters=None,
+    min_gap="30D",
+    merge_within="1D",
+    min_missing_fraction=0.9,
+    count_flat_as_gap=False,
+    min_flat_run="1D",
+    shared_tolerance="1D",
+):
+    """
+    Find long stretches of missing readings (default: a month or more) on
+    every meter in data, to catch meters that may have been broken but are
+    not on the broken list yet.
+
+    - A reading is missing if it is NaN (0s should already be NaN). With
+      count_flat_as_gap=True, stuck runs (same value for at least
+      min_flat_run) count as missing too.
+    - Missing stretches separated by less than merge_within of readings are
+      merged, so a single stray reading doesn't split one outage in two.
+      The merged stretch must still be at least min_missing_fraction
+      missing (missing_pct); if not (a meter with frequent short dropouts),
+      each missing stretch is checked on its own instead.
+    - Gaps that overlap any row of the same meter in broken_df are skipped:
+      those are already on the list, and their edges are handled by
+      detect_broken_boundary_issues. A meter on the broken list can still
+      get a gap here if the gap is outside its broken rows.
+    - gap_type: all_nan (no readings at all), leading (missing from the data
+      start, so it may have started earlier), trailing (missing through the
+      data end, so still broken), internal.
+    - shared_meters: how many other meters have the same gap (start and end
+      within shared_tolerance), counting meters on the broken list. A gap
+      shared by many meters is more likely a data-source outage than a
+      broken meter.
+    - gap_end is NaT for trailing / all_nan gaps (open-ended).
+
+    Returns a DataFrame with DATA_GAP_COLUMNS, sorted by meter and gap start.
+    """
+    min_gap = pd.Timedelta(min_gap)
+    merge_within = pd.Timedelta(merge_within)
+    min_flat_run = pd.Timedelta(min_flat_run)
+    shared_tolerance = pd.Timedelta(shared_tolerance)
+
+    data = data.sort_index()
+    idx = data.index
+    if len(idx) < 2:
+        return pd.DataFrame(columns=DATA_GAP_COLUMNS)
+    freq = idx[1] - idx[0]
+    data_start, data_end = idx[0], idx[-1]
+    last_pos = len(idx) - 1
+
+    if meters is not None:
+        meters = {_normalize_text(m) for m in meters}
+
+    # (start, end) spans of every broken-list row per meter; blank dates are open
+    broken_spans = {}
+    if broken_df is not None and not broken_df.empty:
+        for _, row in broken_df.iterrows():
+            name = _normalize_text(row["meter_name"])
+            start = pd.to_datetime(row.get("start_date"), errors="coerce")
+            end = pd.to_datetime(row.get("end_date"), errors="coerce")
+            broken_spans.setdefault(name, []).append((
+                data_start if pd.isna(start) else start,
+                data_end if pd.isna(end) else end,
+            ))
+
+    gaps = []
+    for col in data.columns:
+        name = _normalize_text(col)
+        if meters is not None and name not in meters:
+            continue
+
+        series = data[col]
+        if count_flat_as_gap:
+            missing = ~_good_reading_mask(series, min_flat_run)
+        else:
+            missing = series.isna().to_numpy()
+
+        # group missing runs separated by less than merge_within of readings
+        groups = []
+        for s, e in _true_runs(missing):
+            if groups and idx[s] - idx[groups[-1][-1][1]] - freq < merge_within:
+                groups[-1].append((s, e))
+            else:
+                groups.append([(s, e)])
+
+        # a merged group must still be mostly missing; otherwise (frequent
+        # short dropouts in otherwise good data) use its runs one by one
+        spans = []
+        for group in groups:
+            s, e = group[0][0], group[-1][1]
+            n_missing = sum(run_e - run_s + 1 for run_s, run_e in group)
+            if len(group) == 1 or n_missing / (e - s + 1) >= min_missing_fraction:
+                spans.append((s, e, n_missing / (e - s + 1)))
+            else:
+                spans.extend((run_s, run_e, 1.0) for run_s, run_e in group)
+
+        for s, e, missing_fraction in spans:
+            gap_start, gap_end = idx[s], idx[e]
+            length = gap_end - gap_start + freq
+            if length < min_gap:
+                continue
+            if s == 0 and e == last_pos:
+                gap_type = "all_nan"
+            elif s == 0:
+                gap_type = "leading"
+            elif e == last_pos:
+                gap_type = "trailing"
+            else:
+                gap_type = "internal"
+            gaps.append({
+                "meter_name": name,
+                "gap_start": gap_start,
+                "gap_end": gap_end,
+                "gap_days": round(length / pd.Timedelta("1D"), 1),
+                "missing_pct": round(100 * missing_fraction, 1),
+                "gap_type": gap_type,
+                "in_broken_list": name in broken_spans,
+                "on_broken_row": any(
+                    gap_start <= b_end and gap_end >= b_start
+                    for b_start, b_end in broken_spans.get(name, [])
+                ),
+            })
+
+    if not gaps:
+        return pd.DataFrame(columns=DATA_GAP_COLUMNS)
+
+    gaps_df = pd.DataFrame(gaps)
+
+    # shared outages: count other meters with (about) the same gap, before
+    # dropping the gaps that are already on the broken list
+    starts = gaps_df["gap_start"].to_numpy()
+    ends = gaps_df["gap_end"].to_numpy()
+    names = gaps_df["meter_name"].to_numpy()
+    tol = shared_tolerance.to_timedelta64()
+    gaps_df["shared_meters"] = [
+        len(set(names[
+            (np.abs(starts - starts[i]) <= tol)
+            & (np.abs(ends - ends[i]) <= tol)
+            & (names != names[i])
+        ]))
+        for i in range(len(gaps_df))
+    ]
+
+    gaps_df = gaps_df[~gaps_df["on_broken_row"]].copy()
+
+    open_ended = gaps_df["gap_type"].isin(["trailing", "all_nan"])
+    gaps_df["gap_end"] = gaps_df["gap_end"].where(~open_ended, pd.NaT)
+
+    return (
+        gaps_df[DATA_GAP_COLUMNS]
+        .sort_values(["meter_name", "gap_start"])
+        .reset_index(drop=True)
+    )
+
+
+# new_description marker that identifies auto-detected gap rows in the update log
+DATA_GAP_LOG_MARKER = "auto-detected data gap"
+
+
+def _is_data_gap_log_row(update_log_df):
+    """add rows with no source row whose new_description has DATA_GAP_LOG_MARKER."""
+    def text(col):
+        return update_log_df[col].fillna("").astype(str).str.strip()
+
+    return (
+        text("action").str.lower().eq("add")
+        & text("source_start_date").eq("")
+        & text("new_description").str.lower().str.contains(DATA_GAP_LOG_MARKER, regex=False)
+    )
+
+
+def _data_gap_log_rows(gap_df, data_source):
+    """Update log rows proposing an add (approved = 0) for each detected gap."""
+    rows = []
+    for _, gap in gap_df.iterrows():
+        if gap["missing_pct"] >= 100:
+            description = f"no readings for {gap['gap_days']:g} days"
+        else:
+            description = f"{gap['missing_pct']:g}% of readings missing over {gap['gap_days']:g} days"
+        description += f" ({DATA_GAP_LOG_MARKER}, {gap['gap_type']}"
+        n = gap["shared_meters"]
+        if n:
+            description += f"; same gap on {n} other meter{'s' if n != 1 else ''}"
+        description += ")"
+
+        rows.append({
+            "meter_name": gap["meter_name"],
+            "source_start_date": "",
+            "source_end_date": "",
+            "source_status": "",
+            "source_description": "",
+            "data_source": data_source,
+            "boundary_check": "",
+            "action": "add",
+            "new_start_date": datetime_to_text(gap["gap_start"]),
+            "new_end_date": datetime_to_text(gap["gap_end"]),
+            "new_status": "broken",
+            "new_description": description,
+            "approved": 0,
+        })
+    return pd.DataFrame(rows, columns=BROKEN_UPDATE_LOG_COLUMNS)
+
+
+def _refresh_data_gap_rows(update_log_df, gap_df, data_source):
+    """
+    Replace the auto-detected gap rows of the update log (found by
+    _is_data_gap_log_row) with the current gaps, placed after every other row.
+
+    An existing gap row with the same meter and new_start_date as a current
+    gap is kept as it is, so edits to the other fields and approvals survive a
+    rerun. Gap rows that no longer match (e.g. the gap was committed to the
+    broken list, so it now overlaps a broken row and isn't detected, or its
+    new_start_date was edited) are dropped, and the gap is proposed again if
+    still detected.
+    """
+    is_gap_row = _is_data_gap_log_row(update_log_df)
+    other_rows = update_log_df[~is_gap_row]
+    existing = update_log_df[is_gap_row].copy()
+
+    def gap_key(df):
+        # parse the date so a reformatted CSV (e.g. saved by Excel) still matches
+        start = pd.to_datetime(df["new_start_date"], errors="coerce").apply(datetime_to_text).astype(str)
+        return df["meter_name"].fillna("").astype(str).str.strip().str.lower() + "||" + start
+
+    new_rows = _data_gap_log_rows(gap_df, data_source)
+    current_keys = set(gap_key(new_rows))
+    existing_keys = gap_key(existing)
+
+    kept = existing[existing_keys.isin(current_keys)]
+    stale = existing[~existing_keys.isin(current_keys)]
+    added = new_rows[~gap_key(new_rows).isin(set(existing_keys))]
+
+    gap_rows = pd.concat([kept, added], ignore_index=True, sort=False)
+    gap_rows = gap_rows.sort_values(
+        ["meter_name", "new_start_date"], kind="stable"
+    )
+
+    stale_approved = int(pd.to_numeric(stale["approved"], errors="coerce").fillna(0).eq(1).sum())
+    print(
+        f"Data gaps: {len(gap_rows)} update log rows ({len(added)} new, "
+        f"{len(kept)} kept from the last run, {len(stale)} no longer detected and dropped"
+        + (f", {stale_approved} of them approved" if stale_approved else "")
+        + "). Gap rows are listed after the broken meter rows."
+    )
+    return pd.concat([other_rows, gap_rows], ignore_index=True, sort=False)
+
+
 def _apply_boundary_suggestions(update_log_df, boundary_checks_df, meters):
     """
     Write boundary check results into the update log for the given meters.
@@ -3175,9 +3542,16 @@ def prepare_broken_meter_update_log(
     refresh_selected_meters=True,
     data_source="harvest",
     boundary_checks_df=None,
+    gap_df=None,
 ):
     """
     Create/load the maintenance update log and refresh selected source rows.
+
+    gap_df: optional output of detect_data_gaps. Each gap gets an add row
+    (action = add, status broken, approved = 0) after all the broken meter
+    rows, with the gap explained in new_description (marked "auto-detected
+    data gap", which is how the row is found again). When gap_df is None, gap rows
+    already in the log are left alone.
 
     data_source: source of the reviewed data, from the schema name
     (e.g. schema 'aurora_v4' -> 'aurora'). Refreshed rows get this value;
@@ -3200,6 +3574,8 @@ def prepare_broken_meter_update_log(
             update_log_df["data_source"] = ""
         if "boundary_check" not in update_log_df.columns:
             update_log_df["boundary_check"] = ""
+        # logs from before the data_gap column was removed
+        update_log_df = update_log_df.drop(columns="data_gap", errors="ignore")
         missing_cols = [
             col
             for col in BROKEN_UPDATE_LOG_COLUMNS
@@ -3219,6 +3595,12 @@ def prepare_broken_meter_update_log(
         for meter in (meters_to_review or [])
         if _normalize_text(meter) != ""
     ]
+
+    # Gap rows have blank source_* fields, so keep them out of the source-row
+    # refresh below (their keys would collide); they go back in at the end.
+    is_gap_row = _is_data_gap_log_row(update_log_df)
+    gap_log_rows = update_log_df[is_gap_row].copy()
+    update_log_df = update_log_df[~is_gap_row].copy()
 
     # Refresh the update log with the current source rows for the selected meters.
     if refresh_selected_meters and normalized_meters:
@@ -3309,6 +3691,15 @@ def prepare_broken_meter_update_log(
         boundary_checks_df,
         set(normalized_meters),
     )
+
+    # Data gap candidates go after all the broken meter rows
+    update_log_df = pd.concat([update_log_df, gap_log_rows], ignore_index=True, sort=False)
+    if gap_df is not None:
+        update_log_df = _refresh_data_gap_rows(update_log_df, gap_df, data_source)
+    update_log_df["approved"] = (
+        pd.to_numeric(update_log_df["approved"], errors="coerce").fillna(0).astype(int)
+    )
+    update_log_df = update_log_df[BROKEN_UPDATE_LOG_COLUMNS].reset_index(drop=True)
 
     update_log_df.to_csv(update_log_file, index=False)
     return update_log_df
@@ -4225,7 +4616,7 @@ def plot_data(df, var, txt="original", fig_path="./"):
     lines_per_page = 5
     chunks = [meter_names[i:i + lines_per_page] for i in range(0, len(meter_names), lines_per_page)]
 
-    with PdfPages(pdf_path) as pdf:
+    with _buffered_pdf_pages(pdf_path) as pdf:
         for i, chunk in enumerate(chunks):
             fig, ax = plt.subplots(figsize=(14, 6))
 
