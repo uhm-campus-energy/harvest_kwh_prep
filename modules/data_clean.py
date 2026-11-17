@@ -13,6 +13,34 @@ from typing import List, Tuple
 
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+import contextlib
+import io
+import time
+
+
+@contextlib.contextmanager
+def _buffered_pdf_pages(path, retries=3):
+    """
+    PdfPages that builds the PDF in memory and writes it to path in one call
+    at the end. Writing page by page to a file held open for minutes has
+    failed intermittently with "[Errno 60] Operation timed out"; one short
+    write (retried on timeout) avoids that. If plotting fails, the previous
+    PDF at path is left as it was.
+    """
+    buffer = io.BytesIO()
+    with PdfPages(buffer) as pdf:
+        yield pdf
+    data = buffer.getvalue()
+    for attempt in range(1, retries + 1):
+        try:
+            with open(path, "wb") as f:
+                f.write(data)
+            return
+        except TimeoutError:
+            if attempt == retries:
+                raise
+            print(f"Writing {path} timed out, retrying ({attempt}/{retries - 1})...")
+            time.sleep(2)
 
 
 # 'broken' is treated like a removal style correction
