@@ -2769,7 +2769,7 @@ def plot_meter_maintenance_review_pdf(
                     "Pages are in the same order as the gap rows at the end of the update log.",
                     "Gaps already covered by a broken list row are not shown here.",
                     "A meter can appear twice: once above for its broken rows, and here for a gap outside them.",
-                    "\"same gap on N other meters\" in new_description usually means a data-source outage, not a broken meter.",
+                    "A gap shared by several meters (shared_meters in the notebook's gap table) usually means a data-source outage, not a broken meter.",
                 ],
             )
 
@@ -3399,35 +3399,21 @@ def detect_data_gaps(
     )
 
 
-# new_description marker that identifies auto-detected gap rows in the update log
 DATA_GAP_LOG_MARKER = "auto-detected data gap"
-
-
-def _is_data_gap_log_row(update_log_df):
-    """add rows with no source row whose new_description has DATA_GAP_LOG_MARKER."""
-    def text(col):
-        return update_log_df[col].fillna("").astype(str).str.strip()
-
-    return (
-        text("action").str.lower().eq("add")
-        & text("source_start_date").eq("")
-        & text("new_description").str.lower().str.contains(DATA_GAP_LOG_MARKER, regex=False)
-    )
 
 
 def _data_gap_log_rows(gap_df, data_source):
     """Update log rows proposing an add (approved = 0) for each detected gap."""
     rows = []
     for _, gap in gap_df.iterrows():
+        # no commas, so the CSV cell isn't quoted
         if gap["missing_pct"] >= 100:
             description = f"no readings for {gap['gap_days']:g} days"
         else:
             description = f"{gap['missing_pct']:g}% of readings missing over {gap['gap_days']:g} days"
-        description += f" ({DATA_GAP_LOG_MARKER}, {gap['gap_type']}"
-        n = gap["shared_meters"]
-        if n:
-            description += f"; same gap on {n} other meter{'s' if n != 1 else ''}"
-        description += ")"
+        if gap["gap_type"] == "all_nan":
+            description = "all NaN - " + description
+        description += f" ({DATA_GAP_LOG_MARKER})"
 
         rows.append({
             "meter_name": gap["meter_name"],
@@ -3445,50 +3431,6 @@ def _data_gap_log_rows(gap_df, data_source):
             "approved": 0,
         })
     return pd.DataFrame(rows, columns=BROKEN_UPDATE_LOG_COLUMNS)
-
-
-def _refresh_data_gap_rows(update_log_df, gap_df, data_source):
-    """
-    Replace the auto-detected gap rows of the update log (found by
-    _is_data_gap_log_row) with the current gaps, placed after every other row.
-
-    An existing gap row with the same meter and new_start_date as a current
-    gap is kept as it is, so edits to the other fields and approvals survive a
-    rerun. Gap rows that no longer match (e.g. the gap was committed to the
-    broken list, so it now overlaps a broken row and isn't detected, or its
-    new_start_date was edited) are dropped, and the gap is proposed again if
-    still detected.
-    """
-    is_gap_row = _is_data_gap_log_row(update_log_df)
-    other_rows = update_log_df[~is_gap_row]
-    existing = update_log_df[is_gap_row].copy()
-
-    def gap_key(df):
-        # parse the date so a reformatted CSV (e.g. saved by Excel) still matches
-        start = pd.to_datetime(df["new_start_date"], errors="coerce").apply(datetime_to_text).astype(str)
-        return df["meter_name"].fillna("").astype(str).str.strip().str.lower() + "||" + start
-
-    new_rows = _data_gap_log_rows(gap_df, data_source)
-    current_keys = set(gap_key(new_rows))
-    existing_keys = gap_key(existing)
-
-    kept = existing[existing_keys.isin(current_keys)]
-    stale = existing[~existing_keys.isin(current_keys)]
-    added = new_rows[~gap_key(new_rows).isin(set(existing_keys))]
-
-    gap_rows = pd.concat([kept, added], ignore_index=True, sort=False)
-    gap_rows = gap_rows.sort_values(
-        ["meter_name", "new_start_date"], kind="stable"
-    )
-
-    stale_approved = int(pd.to_numeric(stale["approved"], errors="coerce").fillna(0).eq(1).sum())
-    print(
-        f"Data gaps: {len(gap_rows)} update log rows ({len(added)} new, "
-        f"{len(kept)} kept from the last run, {len(stale)} no longer detected and dropped"
-        + (f", {stale_approved} of them approved" if stale_approved else "")
-        + "). Gap rows are listed after the broken meter rows."
-    )
-    return pd.concat([other_rows, gap_rows], ignore_index=True, sort=False)
 
 
 def _apply_boundary_suggestions(update_log_df, boundary_checks_df, meters):
@@ -3563,173 +3505,99 @@ def _apply_boundary_suggestions(update_log_df, boundary_checks_df, meters):
     return update_log_df
 
 
+def _blank_log_row(meter_name, data_source, **values):
+    row = {col: "" for col in BROKEN_UPDATE_LOG_COLUMNS}
+    row.update(meter_name=meter_name, data_source=data_source, approved=0, **values)
+    return row
+
+
 def prepare_broken_meter_update_log(
     update_log_file,
     broken_source_df,
     meters_to_review,
-    refresh_selected_meters=True,
+    clear_existing=True,
     data_source="harvest",
     boundary_checks_df=None,
     gap_df=None,
 ):
     """
-    Create/load the maintenance update log and refresh selected source rows.
+    Create the maintenance update log (works like Clear_Candidates in
+    1.kwh_end_points).
 
-    gap_df: optional output of detect_data_gaps. Each gap gets an add row
-    (action = add, status broken, approved = 0) after all the broken meter
-    rows, with the gap explained in new_description (marked "auto-detected
-    data gap", which is how the row is found again). When gap_df is None, gap rows
-    already in the log are left alone.
+    clear_existing=True: the log is rebuilt from scratch, and anything in the
+    old log is discarded:
+      - one row per current broken-list row of meters_to_review, in
+        alphabetical order then by start date
+      - boundary_checks_df (optional, output of detect_broken_boundary_issues):
+        boundary_check filled in, and action = update with the suggested
+        new_start_date / new_end_date prefilled (approved = 0)
+      - gap_df (optional, output of detect_data_gaps): one add row per gap
+        (status broken, approved = 0) after all the broken meter rows, with
+        the gap explained in new_description
+    clear_existing=False: the existing log is returned exactly as saved (not
+    changed or rewritten), so your edits and approvals are used as is. If no
+    log exists yet, one is built as with clear_existing=True.
 
     data_source: source of the reviewed data, from the schema name
-    (e.g. schema 'aurora_v4' -> 'aurora'). Refreshed rows get this value;
+    (e.g. schema 'aurora_v4' -> 'aurora'). New rows get this value;
     approved update/add actions write it to the broken list's data_source.
-
-    boundary_checks_df: optional output of detect_broken_boundary_issues.
-    The selected meters' rows get the explanation in boundary_check, and
-    untouched rows get action = update with the suggested new_start_date /
-    new_end_date prefilled (approved stays 0).
     """
+    if not clear_existing and os.path.exists(update_log_file):
+        update_log_df = pd.read_csv(update_log_file)
+        missing_cols = [col for col in BROKEN_UPDATE_LOG_COLUMNS if col not in update_log_df.columns]
+        if missing_cols:
+            raise ValueError(
+                f"Update log file is missing columns: {missing_cols}. "
+                "Rebuild it with clear_update_log = True."
+            )
+        print(f"Using the existing update log as saved (not rebuilt): {update_log_file}")
+        return update_log_df
+
     data_source = _normalize_text(data_source)
     output_dir = os.path.dirname(str(update_log_file))
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    if os.path.exists(update_log_file):
-        update_log_df = pd.read_csv(update_log_file)
-        # older logs were created before the data_source column existed
-        if "data_source" not in update_log_df.columns:
-            update_log_df["data_source"] = ""
-        if "boundary_check" not in update_log_df.columns:
-            update_log_df["boundary_check"] = ""
-        # logs from before the data_gap column was removed
-        update_log_df = update_log_df.drop(columns="data_gap", errors="ignore")
-        missing_cols = [
-            col
-            for col in BROKEN_UPDATE_LOG_COLUMNS
-            if col not in update_log_df.columns
-        ]
-        if missing_cols:
-            raise ValueError(
-                f"Update log file is missing columns: {missing_cols}"
-            )
-    else:
-        update_log_df = pd.DataFrame(columns=BROKEN_UPDATE_LOG_COLUMNS)
-        update_log_df.to_csv(update_log_file, index=False)
-        print(f"Created new update log: {update_log_file}")
-
-    normalized_meters = [
+    meters = sorted({
         _normalize_text(meter)
         for meter in (meters_to_review or [])
         if _normalize_text(meter) != ""
-    ]
+    })
 
-    # Gap rows have blank source_* fields, so keep them out of the source-row
-    # refresh below (their keys would collide); they go back in at the end.
-    is_gap_row = _is_data_gap_log_row(update_log_df)
-    gap_log_rows = update_log_df[is_gap_row].copy()
-    update_log_df = update_log_df[~is_gap_row].copy()
+    rows = []
+    for meter_name in meters:
+        meter_source = broken_source_df[broken_source_df["meter_name"].eq(meter_name)]
+        if meter_source.empty:
+            rows.append(_blank_log_row(meter_name, data_source))
+            continue
+        meter_source = meter_source.sort_values("start_date", na_position="first")
+        for _, row in meter_source.iterrows():
+            rows.append(_blank_log_row(
+                meter_name,
+                data_source,
+                source_start_date=datetime_to_text(row["start_date"]),
+                source_end_date=datetime_to_text(row["end_date"]),
+                source_status=str(row["status"]).strip(),
+                source_description=str(row["description"]).strip(),
+            ))
+    update_log_df = pd.DataFrame(rows, columns=BROKEN_UPDATE_LOG_COLUMNS)
 
-    # Refresh the update log with the current source rows for the selected meters.
-    if refresh_selected_meters and normalized_meters:
-        selected_rows = []
-
-        for meter_name in normalized_meters:
-            meter_source = broken_source_df[
-                broken_source_df["meter_name"].eq(meter_name)
-            ].copy()
-
-            if meter_source.empty:
-                selected_rows.append({
-                    "meter_name": meter_name,
-                    "source_start_date": "",
-                    "source_end_date": "",
-                    "source_status": "",
-                    "source_description": "",
-                    "data_source": data_source,
-                    "boundary_check": "",
-                    "action": "",
-                    "new_start_date": "",
-                    "new_end_date": "",
-                    "new_status": "",
-                    "new_description": "",
-                    "approved": 0,
-                })
-            else:
-                for _, row in meter_source.iterrows():
-                    selected_rows.append({
-                        "meter_name": meter_name,
-                        "source_start_date": datetime_to_text(row["start_date"]),
-                        "source_end_date": datetime_to_text(row["end_date"]),
-                        "source_status": str(row["status"]).strip(),
-                        "source_description": str(row["description"]).strip(),
-                        "data_source": data_source,
-                        "boundary_check": "",
-                        "action": "",
-                        "new_start_date": "",
-                        "new_end_date": "",
-                        "new_status": "",
-                        "new_description": "",
-                        "approved": 0,
-                    })
-
-        selected_log_df = pd.DataFrame(
-            selected_rows,
-            columns=BROKEN_UPDATE_LOG_COLUMNS,
-        )
-
-        update_log_df["_key"] = _build_update_key(update_log_df)
-        selected_log_df["_key"] = _build_update_key(selected_log_df)
-
-        selected_keys = set(selected_log_df["_key"])
-        preserved_existing = update_log_df[update_log_df["_key"].isin(selected_keys)].copy()
-        preserved_other = update_log_df[~update_log_df["_key"].isin(selected_keys)].copy()
-
-        combined_refresh_rows = pd.concat(
-            [preserved_existing, selected_log_df],
-            ignore_index=True,
-            sort=False,
-        )
-        combined_refresh_rows = combined_refresh_rows.drop_duplicates(
-            subset="_key",
-            keep="first",
-        )
-        # refreshed rows reflect the data reviewed in this run
-        combined_refresh_rows["data_source"] = data_source
-        update_log_df = pd.concat(
-            [preserved_other, combined_refresh_rows],
-            ignore_index=True,
-            sort=False,
-        )
-        update_log_df = update_log_df.drop(
-            columns="_key",
-            errors="ignore",
-        )
-
-    update_log_df["approved"] = (
-        pd.to_numeric(update_log_df["approved"], errors="coerce")
-        .fillna(0)
-        .astype(int)
-    )
-    update_log_df = update_log_df[BROKEN_UPDATE_LOG_COLUMNS].copy()
-
-    # Prefill untouched rows of the selected meters with boundary check dates
-    update_log_df = _apply_boundary_suggestions(
-        update_log_df,
-        boundary_checks_df,
-        set(normalized_meters),
-    )
+    # Prefill the selected meters' rows with boundary check dates
+    update_log_df = _apply_boundary_suggestions(update_log_df, boundary_checks_df, set(meters))
 
     # Data gap candidates go after all the broken meter rows
-    update_log_df = pd.concat([update_log_df, gap_log_rows], ignore_index=True, sort=False)
-    if gap_df is not None:
-        update_log_df = _refresh_data_gap_rows(update_log_df, gap_df, data_source)
-    update_log_df["approved"] = (
-        pd.to_numeric(update_log_df["approved"], errors="coerce").fillna(0).astype(int)
-    )
-    update_log_df = update_log_df[BROKEN_UPDATE_LOG_COLUMNS].reset_index(drop=True)
+    n_gap_rows = 0
+    if gap_df is not None and not gap_df.empty:
+        gap_rows = _data_gap_log_rows(gap_df, data_source)
+        n_gap_rows = len(gap_rows)
+        update_log_df = pd.concat([update_log_df, gap_rows], ignore_index=True, sort=False)
 
+    update_log_df = update_log_df[BROKEN_UPDATE_LOG_COLUMNS].reset_index(drop=True)
     update_log_df.to_csv(update_log_file, index=False)
+    print(
+        f"Rebuilt update log from scratch: {len(update_log_df) - n_gap_rows} broken meter rows"
+        f" + {n_gap_rows} data gap rows -> {update_log_file}"
+    )
     return update_log_df
 
 
