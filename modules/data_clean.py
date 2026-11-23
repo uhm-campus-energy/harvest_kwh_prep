@@ -2938,6 +2938,20 @@ def datetime_to_text(value):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def date_to_text(value):
+    """
+    Same as datetime_to_text but date only (YYYY-MM-DD), the format used for
+    start_date / end_date / updated_data in the broken meter list and update log.
+    Returns an empty string for NaT or invalid values.
+    """
+    if pd.isna(value) or value == "":
+        return ""
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return dt.strftime("%Y-%m-%d")
+
+
 def parse_strict_datetime_value(value, field_name):
     """
     Parse one maintenance log datetime using the shared strict formats.
@@ -3103,8 +3117,8 @@ def detect_broken_boundary_issues(
 
             base = {
                 "meter_name": meter_name,
-                "source_start_date": datetime_to_text(start),
-                "source_end_date": datetime_to_text(end),
+                "source_start_date": date_to_text(start),
+                "source_end_date": date_to_text(end),
                 "source_status": row["status"],
                 "source_description": row["description"],
             }
@@ -3113,8 +3127,8 @@ def detect_broken_boundary_issues(
                 rows.append({
                     **base,
                     "check": check,
-                    "suggested_start_date": datetime_to_text(suggested_start),
-                    "suggested_end_date": datetime_to_text(suggested_end),
+                    "suggested_start_date": date_to_text(suggested_start),
+                    "suggested_end_date": date_to_text(suggested_end),
                     "detail": detail,
                 })
 
@@ -3424,8 +3438,8 @@ def _data_gap_log_rows(gap_df, data_source):
             "data_source": data_source,
             "boundary_check": "",
             "action": "add",
-            "new_start_date": datetime_to_text(gap["gap_start"]),
-            "new_end_date": datetime_to_text(gap["gap_end"]),
+            "new_start_date": date_to_text(gap["gap_start"]),
+            "new_end_date": date_to_text(gap["gap_end"]),
             "new_status": "broken",
             "new_description": description,
             "approved": 0,
@@ -3575,8 +3589,8 @@ def prepare_broken_meter_update_log(
             rows.append(_blank_log_row(
                 meter_name,
                 data_source,
-                source_start_date=datetime_to_text(row["start_date"]),
-                source_end_date=datetime_to_text(row["end_date"]),
+                source_start_date=date_to_text(row["start_date"]),
+                source_end_date=date_to_text(row["end_date"]),
                 source_status=str(row["status"]).strip(),
                 source_description=str(row["description"]).strip(),
             ))
@@ -3603,8 +3617,8 @@ def prepare_broken_meter_update_log(
 
 def _match_existing_broken_rows(df, log_row):
     meter_name = _normalize_text(log_row["meter_name"])
-    src_start = datetime_to_text(log_row["source_start_date"])
-    src_end = datetime_to_text(log_row["source_end_date"])
+    src_start = date_to_text(log_row["source_start_date"])
+    src_end = date_to_text(log_row["source_end_date"])
     src_status = _normalize_text(log_row["source_status"], underscore=True)
     src_desc = _normalize_text(log_row["source_description"])
 
@@ -3614,8 +3628,8 @@ def _match_existing_broken_rows(df, log_row):
         & df["description"].fillna("").astype(str).str.strip().str.lower().eq(src_desc)
     )
 
-    start_text = df["start_date"].apply(datetime_to_text)
-    end_text = df["end_date"].apply(datetime_to_text)
+    start_text = df["start_date"].apply(date_to_text)
+    end_text = df["end_date"].apply(date_to_text)
     mask = mask & start_text.eq(src_start) & end_text.eq(src_end)
     return df[mask]
 
@@ -3674,15 +3688,15 @@ def apply_broken_meter_update_actions(
     reviewed_broken_df["status"] = reviewed_broken_df["status"].apply(lambda value: _normalize_text(value, underscore=True))
     reviewed_broken_df["description"] = reviewed_broken_df["description"].apply(lambda value: _normalize_text(value, lower=False))
     reviewed_broken_df["data_source"] = reviewed_broken_df["data_source"].apply(_normalize_text)
-    reviewed_broken_df["start_date"] = pd.to_datetime(reviewed_broken_df["start_date"], errors="coerce")
-    reviewed_broken_df["end_date"] = pd.to_datetime(reviewed_broken_df["end_date"], errors="coerce")
-    reviewed_broken_df["updated_data"] = pd.to_datetime(reviewed_broken_df["updated_data"], errors="coerce")
+    # start_date / end_date / updated_data are kept as dates only (no time)
+    for col in ["start_date", "end_date", "updated_data"]:
+        reviewed_broken_df[col] = pd.to_datetime(reviewed_broken_df[col], errors="coerce").dt.normalize()
 
     applied_change_log = []
     if now_ts is None:
-        now_ts = pd.Timestamp.now().floor("s")
+        now_ts = pd.Timestamp.now().normalize()
     else:
-        now_ts = pd.to_datetime(now_ts).floor("s")
+        now_ts = pd.to_datetime(now_ts).normalize()
 
     for _, log_row in approved_update_rows.iterrows():
         action = log_row["action"]
@@ -3718,8 +3732,8 @@ def apply_broken_meter_update_actions(
                     "meter_name": meter_name,
                     "action": "remove",
                     "result": "removed source row",
-                    "old_start_date": datetime_to_text(removed_row["start_date"]),
-                    "old_end_date": datetime_to_text(removed_row["end_date"]),
+                    "old_start_date": date_to_text(removed_row["start_date"]),
+                    "old_end_date": date_to_text(removed_row["end_date"]),
                     "old_status": removed_row["status"],
                     "new_start_date": "",
                     "new_end_date": "",
@@ -3783,11 +3797,11 @@ def apply_broken_meter_update_actions(
                 "meter_name": meter_name,
                 "action": "update",
                 "result": "updated source row",
-                "old_start_date": datetime_to_text(old_row["start_date"]),
-                "old_end_date": datetime_to_text(old_row["end_date"]),
+                "old_start_date": date_to_text(old_row["start_date"]),
+                "old_end_date": date_to_text(old_row["end_date"]),
                 "old_status": old_row["status"],
-                "new_start_date": datetime_to_text(new_start),
-                "new_end_date": datetime_to_text(new_end),
+                "new_start_date": date_to_text(new_start),
+                "new_end_date": date_to_text(new_end),
                 "new_status": new_status,
             })
 
@@ -3831,8 +3845,8 @@ def apply_broken_meter_update_actions(
                 reviewed_broken_df["meter_name"].eq(meter_name)
                 & reviewed_broken_df["status"].eq(new_status)
                 & reviewed_broken_df["description"].str.lower().eq(new_desc.lower())
-                & reviewed_broken_df["start_date"].apply(datetime_to_text).eq(datetime_to_text(new_start))
-                & reviewed_broken_df["end_date"].apply(datetime_to_text).eq(datetime_to_text(new_end))
+                & reviewed_broken_df["start_date"].apply(date_to_text).eq(date_to_text(new_start))
+                & reviewed_broken_df["end_date"].apply(date_to_text).eq(date_to_text(new_end))
             )
             if duplicate_mask.any():
                 raise ValueError(
@@ -3862,8 +3876,8 @@ def apply_broken_meter_update_actions(
                 "old_start_date": "",
                 "old_end_date": "",
                 "old_status": "",
-                "new_start_date": datetime_to_text(new_start),
-                "new_end_date": datetime_to_text(new_end),
+                "new_start_date": date_to_text(new_start),
+                "new_end_date": date_to_text(new_end),
                 "new_status": new_status,
             })
 
@@ -3871,6 +3885,9 @@ def apply_broken_meter_update_actions(
         reviewed_broken_df = pd.DataFrame(columns=REQUIRED_BROKEN_METER_COLUMNS)
 
     reviewed_broken_df = reviewed_broken_df[REQUIRED_BROKEN_METER_COLUMNS].copy()
+    # drop any time from new log dates so the list stays date only
+    for col in ["start_date", "end_date", "updated_data"]:
+        reviewed_broken_df[col] = pd.to_datetime(reviewed_broken_df[col], errors="coerce").dt.normalize()
     reviewed_broken_df = reviewed_broken_df.sort_values(
         by=["meter_name", "start_date", "end_date", "status"],
         na_position="last",
@@ -3885,7 +3902,7 @@ def apply_broken_meter_update_actions(
         reviewed_broken_df.to_csv(
             reviewed_copy_file,
             index=False,
-            date_format="%Y-%m-%d %H:%M:%S",
+            date_format="%Y-%m-%d",
         )
         print(
             f"Reviewed broken meter copy saved to {reviewed_copy_file}"
